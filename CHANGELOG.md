@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.0
+
+- The usage summary moved from the footer status to a line right under the editor. Below 100 columns it shows only the usage per account, colored red when a window would run out before it resets or usage is spiking, instead of the long warning (which also squeezed the footer on phones).
+- Clicking the usage line opens or closes the panel (fullscreen mode).
+- The panel now shows on narrow terminals as long as it fits (44 columns), so it can be opened from a phone.
+
 ## 0.5.1
 
 - The panel shortcut is now `ctrl+shift+r` (`alt+u` still works). On Linux, `ctrl+shift+u` is taken by fcitx5/IBus and, when the input method passes it on, by GTK's built-in hex Unicode entry, which hides its input so the terminal looks frozen until Space or Enter commits a stray character.

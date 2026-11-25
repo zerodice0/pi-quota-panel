@@ -30,13 +30,13 @@ Accounts are read from pi's own login (`/login`). Providers you are not logged i
 
 ## Usage
 
-The panel starts hidden. Collection, the status line and spike warnings run in every interactive (TUI) pi session whether or not the panel is shown:
+The panel starts hidden. Collection, the usage line under the editor and spike warnings run in every interactive (TUI) pi session whether or not the panel is shown:
 
 ```
 Claude 5h 42% +22%/h 19:01 소진 큰 컨텍스트 반복 · Codex 7d 77%
 ```
 
-The status line shows each account's 5-hour usage (7-day when there is no 5-hour window), the burn rate while it is rising, the projected exhaustion time when the window would run out before it resets, and the cause of a spike.
+The usage line shows each account's 5-hour usage (7-day when there is no 5-hour window), the burn rate while it is rising, the projected exhaustion time when the window would run out before it resets, and the cause of a spike. Below 100 columns (phones, split panes) it only shows the usage, colored red when a window would run out before it resets or usage is spiking (`Claude 7d 19% · Codex 7d 78%`). Click it to open or close the panel (fullscreen mode; otherwise use the shortcut).
 
 | Action | How |
 |---|---|
@@ -54,7 +54,7 @@ The position is saved in `~/.pi/agent/quota-panel.json` and kept as an offset fr
 
 When a token is missing or rejected (HTTP 401/403), the row shows `로그인 필요 · /quota login`. Extensions cannot run pi's built-in `/login` themselves, so `/quota login` fills the editor with `/login <provider>`; press Enter to start the login. The panel watches `~/.pi/agent/auth.json` and refreshes as soon as the login finishes. Other failures (rate limits, network errors) show the reason and are retried on the next refresh.
 
-The panel is hidden when the terminal is narrower than 82 columns.
+The panel is hidden when the terminal is too narrow to fit it (44 columns).
 
 ## Burn rate and history
 
@@ -70,7 +70,7 @@ Records older than 60 days are removed. If `node:sqlite` is unavailable the pane
 
 ## Finding the cause of a spike
 
-When the 5-hour usage rises by 5 points or more within 15 minutes, or either window would run out before it resets, the panel analyzes the last hour of this machine's pi sessions and adds a `원인:` line with the main pattern (also shown in the status line while the panel is hidden). If the current session accounts for at least 20% of that hour's cost, it also shows a warning with the action to take (at most once every 30 minutes per account).
+When the 5-hour usage rises by 5 points or more within 15 minutes, or either window would run out before it resets, the panel analyzes the last hour of this machine's pi sessions and adds a `원인:` line with the main pattern (also shown in the usage line while the panel is hidden). If the current session accounts for at least 20% of that hour's cost, it also shows a warning with the action to take (at most once every 30 minutes per account).
 
 `/quota why` opens the full analysis: the usage rise, the main cause and the action, other causes, the top sessions (the current one is marked), the cost split, context size, models and tools. `tab` switches accounts, `←`/`→` change the range, `esc` closes it.
 

@@ -274,17 +274,23 @@ function whyLines(r: Report | undefined, rangeLabel: string): string[] {
 const isDanger = (w: Win) => !!w?.trend?.eta && w.trend.rate > 0 && w.trend.eta < w.resetAt;
 
 /**
- * 하단 상태줄 한 줄 요약. 계정마다 5h 구간(없으면 7d)의 사용률을 보이고, 늘고 있으면 속도를,
- * 리셋 전에 소진될 속도면 소진 예상 시각을 붙임. 예: "Claude 5h 42% +22%/h 19:01 소진 · Codex 7d 77%"
+ * 편집창 아래 사용량 줄의 내용. detail에 따라 길이를 줄임
+ * - full: 사용률에 속도, 소진 예상 시각, 급증 원인까지. 예: "Claude 5h 42% +22%/h 19:01 소진 큰 컨텍스트 반복 · Codex 7d 77%"
+ * - compact: 사용률만. 리셋 전에 소진될 속도이거나 급증 원인이 있으면 사용률을 빨간색으로 칠함
+ * - tiny: compact에서 구간 표시(5h/7d)까지 뺌
  */
-function statusText(rows: Row[]): string | undefined {
-	if (!rows.length) return undefined;
+type Detail = "full" | "compact" | "tiny";
+function statusText(rows: Row[], detail: Detail): string {
 	const parts = rows.map((r) => {
 		const name = fg(C.name, r.name);
 		if (r.error) return `${name} ${fg(r.needsLogin ? C.warn : C.crit, r.needsLogin ? "로그인 필요" : "조회 실패")}`;
 		const [label, w] = r.h5 ? (["5h", r.h5] as const) : (["7d", r.d7] as const);
 		if (!w) return `${name} ${fg(C.dim, "기록 없음")}`;
-		let text = `${name} ${fg(C.label, label)} ${fg(levelColor(w.pct), `${Math.round(w.pct)}%`)}`;
+		const alert = isDanger(r.h5) || isDanger(r.d7) || !!r.cause;
+		const pct = `${Math.round(w.pct)}%`;
+		const head = detail === "tiny" ? name : `${name} ${fg(C.label, label)}`;
+		if (detail !== "full") return `${head} ${fg(alert ? C.crit : levelColor(w.pct), pct)}`;
+		let text = `${head} ${fg(levelColor(w.pct), pct)}`;
 		const t = trendText(w);
 		if (t) {
 			const rate = t.text.split(" · ")[0];
@@ -294,6 +300,17 @@ function statusText(rows: Row[]): string | undefined {
 		return text;
 	});
 	return parts.join(fg(C.dim, " · "));
+}
+
+/** 너비에 맞는 가장 자세한 표시를 고름. 좁은 화면(100칸 미만)에서는 긴 경고 대신 색으로만 알림 */
+function statusLine(rows: Row[], width: number): string | undefined {
+	if (!rows.length || width <= 0) return undefined;
+	const details: Detail[] = width >= 100 ? ["full", "compact", "tiny"] : ["compact", "tiny"];
+	for (const d of details) {
+		const text = statusText(rows, d);
+		if (visibleWidth(text) <= width) return text;
+	}
+	return truncateToWidth(statusText(rows, "tiny"), width);
 }
 
 type Position = { offsetX: number; offsetY: number };
@@ -402,7 +419,8 @@ export default function (pi: ExtensionAPI) {
 		width: WIDTH,
 		margin: { top: MARGIN_TOP, right: MARGIN_RIGHT },
 		nonCapturing: true,
-		visible: (w) => w >= WIDTH + 40,
+		// 사용량 줄을 눌러 여는 경우가 있으므로 좁은 화면(휴대폰 등)에서도 패널이 들어가기만 하면 띄움
+		visible: (w) => w >= WIDTH + MARGIN_RIGHT + 1,
 		...readPosition(),
 	};
 	const savePosition = () => {
@@ -534,10 +552,8 @@ export default function (pi: ExtensionAPI) {
 		panel.updatedAt = status.fetchedAt;
 		panel.loading = false;
 		rerender?.();
-		// 패널을 숨겨도 하단 상태줄에서 사용률과 급증 여부를 볼 수 있게 함
-		try {
-			lastCtx?.ui.setStatus(STATUS_KEY, statusText(panel.rows));
-		} catch {}
+		// 패널을 숨겨도 편집창 아래 사용량 줄에서 사용률과 급증 여부를 볼 수 있게 함
+		renderUsageLine?.();
 	};
 
 	const record = (status: Status) =>
@@ -650,6 +666,39 @@ export default function (pi: ExtensionAPI) {
 		timer = tick = authWatch = ingestTimer = ingestKick = undefined;
 	};
 
+	// ── 사용량 줄 ──
+	/**
+	 * 편집창 바로 아래에 붙는 한 줄. 하단 상태줄(setStatus) 대신 위젯을 쓰는 이유:
+	 * 그려질 너비를 알아야 좁은 화면에서 줄일 수 있고, 클릭(fullscreen)을 받으려면 이 확장의 컴포넌트여야 함.
+	 * 클릭하면 패널을 열고 닫음. 키보드로는 ctrl+shift+r / alt+u / /quota
+	 */
+	let renderUsageLine: (() => void) | undefined;
+	const mountUsageLine = (ctx: ExtensionContext) => {
+		try {
+			ctx.ui.setWidget(
+				STATUS_KEY,
+				(t) => {
+					renderUsageLine = () => t.requestRender();
+					return {
+						render(width: number) {
+							const text = statusLine(panel.rows, width - 1);
+							if (!text) return [];
+							// 오른쪽 정렬(하단 상태줄과 같은 자리)
+							return [" ".repeat(Math.max(0, width - visibleWidth(text) - 1)) + text];
+						},
+						invalidate() {},
+						handleMouse(event: TuiMouseEvent) {
+							if (event.type !== "press" || event.button !== "left") return undefined;
+							if (lastCtx) toggle(lastCtx);
+							return { handled: true, render: true };
+						},
+					};
+				},
+				{ placement: "belowEditor" },
+			);
+		} catch {}
+	};
+
 	// ── 수집 ──
 	/**
 	 * 패널을 숨겨도 이력 수집과 급증 경고가 이어지도록, TUI 세션이 시작되면 수집 타이머를 켬.
@@ -661,6 +710,7 @@ export default function (pi: ExtensionAPI) {
 		lastCtx = ctx;
 		if (collecting) return;
 		collecting = true;
+		mountUsageLine(ctx);
 		authStamp = authFingerprint();
 		// 공유 결과가 최신이면 API를 부르지 않고 그 결과를 씀
 		void refresh(ctx);
@@ -1003,8 +1053,9 @@ export default function (pi: ExtensionAPI) {
 		stopCollector();
 		close?.();
 		try {
-			lastCtx?.ui.setStatus(STATUS_KEY, undefined);
+			lastCtx?.ui.setWidget(STATUS_KEY, undefined);
 		} catch {}
+		renderUsageLine = undefined;
 		store?.close();
 		store = undefined;
 	});

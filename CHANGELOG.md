@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.0
+
+- Burn rate under each window (`%/h` for 5h, `%/일` for 7d) with the projected exhaustion time when the window would run out before it resets.
+- Usage history in `~/.pi/agent/quota-panel.db` (built-in `node:sqlite`): utilization samples and per-turn token counts collected incrementally from pi's session logs, kept for 60 days.
+- pi sessions on the same machine share one usage fetch through a database lease instead of each calling the usage API every 3 minutes.
+
 ## 0.2.0
 
 - Move the panel with the keyboard: `/quota move` starts a move mode (arrow keys or `hjkl`, `shift` for bigger steps, `enter` saves, `esc` cancels), and `/quota move <direction> [cells]` or `/quota move <corner>` moves it in one step. This works in regular TUI mode, where the mouse belongs to the terminal.

@@ -9,6 +9,7 @@ import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { KeyId, OverlayHandle, OverlayOptions, TUI, TuiMouseEvent } from "@earendil-works/pi-tui";
 import { Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { openStore, type Sample, type Store, type WindowKey } from "./db.ts";
 
 // ── titanium 팔레트 ──────────────────────────────────────────
 const rgb = (hex: string) => {
@@ -50,7 +51,10 @@ const PROVIDERS: { id: ProviderId; name: string; aliases: string[] }[] = [
 	{ id: "openai-codex", name: "Codex", aliases: ["codex", "openai-codex", "openai"] },
 ];
 
-type Win = { pct: number; resetAt: number } | null;
+/** rate는 단위 시간(5h는 1시간, 7d는 1일)당 늘어난 %p, eta는 이 속도로 100%에 닿는 시각 */
+type Trend = { rate: number; unit: "h" | "d"; eta?: number };
+type Win = { pct: number; resetAt: number; trend?: Trend } | null;
+type Status = { fetchedAt: number; rows: Row[] };
 type Row = { id: ProviderId; name: string; h5: Win; d7: Win; error?: string; needsLogin?: boolean };
 
 /** 다시 로그인해야 풀리는 오류(토큰 없음·만료, HTTP 401/403) */
@@ -163,6 +167,49 @@ function ago(ts: number): string {
 	return `${Math.floor(s / 60)}분 전`;
 }
 
+// ── 소모 속도 ──────────────────────────────────────────────
+// 5h는 최근 1시간, 7d는 최근 24시간의 표본으로 속도를 구함. 표본 간격이 너무 짧으면 흔들리므로 최소 구간을 둠
+const TREND = {
+	"5h": { span: 3600_000, minSpan: 10 * 60_000, unit: "h", unitMs: 3600_000 },
+	"7d": { span: 24 * 3600_000, minSpan: 2 * 3600_000, unit: "d", unitMs: 24 * 3600_000 },
+} as const;
+
+function trendOf(samples: Sample[], win: NonNullable<Win>, key: WindowKey): Trend | undefined {
+	const cfg = TREND[key];
+	// 리셋으로 사용률이 떨어진 뒤의 표본만 씁
+	let start = 0;
+	for (let i = 1; i < samples.length; i++) if (samples[i].pct < samples[i - 1].pct - 0.5) start = i;
+	const s = samples.slice(start);
+	if (s.length < 2) return undefined;
+	const first = s[0];
+	const last = s[s.length - 1];
+	const dt = last.at - first.at;
+	if (dt < cfg.minSpan) return undefined;
+	const perMs = (last.pct - first.pct) / dt;
+	return {
+		rate: perMs * cfg.unitMs,
+		unit: cfg.unit,
+		eta: perMs > 0 ? last.at + Math.max(0, 100 - win.pct) / perMs : undefined,
+	};
+}
+
+function clock(ts: number): string {
+	const d = new Date(ts);
+	const now = new Date();
+	const hm = `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+	return d.toDateString() === now.toDateString() ? hm : `${d.getDate()}일 ${d.getHours()}시`;
+}
+
+/** 예: "+18%/h · 14:20 소진 예상"(리셋 전에 다 씀), "+4%/h · 리셋까지 여유" */
+function trendText(w: NonNullable<Win>): { text: string; danger: boolean } | undefined {
+	const t = w.trend;
+	if (!t || t.rate <= 0) return undefined;
+	const value = t.rate >= 10 ? Math.round(t.rate) : Math.round(t.rate * 10) / 10;
+	const rate = `+${value}%/${t.unit === "h" ? "h" : "일"}`;
+	const danger = t.eta !== undefined && t.eta < w.resetAt;
+	return { text: danger ? `${rate} · ${clock(t.eta!)} 소진 예상` : `${rate} · 리셋까지 여유`, danger };
+}
+
 type Position = { offsetX: number; offsetY: number };
 
 function readPosition(): Position {
@@ -227,7 +274,12 @@ class QuotaPanel {
 			// 값이 없는 구간(예: 5h 구간이 아직 시작되지 않음)은 숨김
 			const wins = ([["5h", r.h5], ["7d", r.d7]] as const).filter(([, w]) => w);
 			if (!wins.length) out.push(win("  ", null, true));
-			wins.forEach(([label, w], j) => out.push(win(label, w, j === 0)));
+			wins.forEach(([label, w], j) => {
+				out.push(win(label, w, j === 0));
+				// 소모 속도가 있을 때만 한 줄 더 표시. 리셋 전에 다 쓸 속도면 빨간색
+				const t = w && trendText(w);
+				if (t) out.push(line(`${" ".repeat(7)}${fg(t.danger ? C.crit : C.dim, t.text)}`));
+			});
 		});
 
 		out.push(line("")); // 아래쪽 여백
@@ -274,7 +326,24 @@ export default function (pi: ExtensionAPI) {
 	let authWatch: ReturnType<typeof setInterval> | undefined;
 	let authStamp = "";
 	let refreshing: Promise<void> | undefined;
+	let ingestTimer: ReturnType<typeof setInterval> | undefined;
 	let visible = false;
+	// undefined: 아직 열지 않음, null: node:sqlite를 쓸 수 없어 이력 없이 동작
+	let store: Store | null | undefined;
+	const getStore = () => {
+		if (store === undefined) store = openStore() ?? null;
+		return store ?? undefined;
+	};
+	// DB 오류(잠금 대기 초과 등)로 pi가 멈추거나 죽지 않도록 모든 저장소 호출을 감쌌
+	const withStore = <T>(fn: (s: Store) => T): T | undefined => {
+		const s = getStore();
+		if (!s) return undefined;
+		try {
+			return fn(s);
+		} catch {
+			return undefined;
+		}
+	};
 
 	// ── 위치 ──
 	// 화면 밖으로 쌓인 offset이 없도록 직접 범위를 제한(되돌아올 때 헛도는 구간 방지)
@@ -291,20 +360,94 @@ export default function (pi: ExtensionAPI) {
 	const moveBy = (dx: number, dy: number) => placeAt((options.offsetX ?? 0) + dx, (options.offsetY ?? 0) + dy);
 
 	// ── 조회 ──
-	const refresh = (ctx: ExtensionContext) => {
+	// 조회 결과를 패널에 반영하고, 저장된 표본으로 소모 속도를 붙임
+	const apply = (status: Status) => {
+		const now = Date.now();
+		panel.rows = status.rows.map((r) => {
+			const row: Row = { ...r };
+			for (const key of ["5h", "7d"] as const) {
+				const prop = key === "5h" ? "h5" : "d7";
+				const w = row[prop];
+				if (!w) continue;
+				const samples = withStore((s) => s.samples(r.id, key, now - TREND[key].span)) ?? [];
+				row[prop] = { pct: w.pct, resetAt: w.resetAt, trend: trendOf(samples, w, key) };
+			}
+			return row;
+		});
+		panel.updatedAt = status.fetchedAt;
+		panel.loading = false;
+		rerender?.();
+	};
+
+	const record = (status: Status) =>
+		withStore((s) =>
+			s.transaction(() => {
+				for (const r of status.rows) {
+					if (r.error) continue;
+					if (r.h5) s.addSample(r.id, "5h", status.fetchedAt, r.h5.pct, r.h5.resetAt);
+					if (r.d7) s.addSample(r.id, "7d", status.fetchedAt, r.d7.pct, r.d7.resetAt);
+				}
+				s.setMeta("status", status);
+			}),
+		);
+
+	/**
+	 * 여러 pi 프로세스가 같은 DB를 공유하므로, 최근 조회 결과가 있으면 API를 부르지 않고 그 결과를 씁.
+	 * API는 'fetch' 임대를 잡은 한 프로세스만 부름. force면 최근 결과가 있어도 다시 조회
+	 */
+	const refresh = (ctx: ExtensionContext, force = false) => {
 		if (refreshing) return refreshing;
 		refreshing = (async () => {
-			panel.loading = true;
-			rerender?.();
-			const rows = await Promise.all([fetchAnthropic(ctx), fetchCodex(ctx)]);
-			panel.rows = rows.filter((r): r is Row => r !== null);
-			panel.loading = false;
-			panel.updatedAt = Date.now();
-			rerender?.();
+			const shared = withStore((s) => s.getMeta<Status>("status"));
+			if (!force && shared && Date.now() - shared.fetchedAt < REFRESH_MS - 15_000) {
+				apply(shared);
+				return;
+			}
+			const leased = withStore((s) => s.tryLease("fetch", 30_000));
+			if (leased === false) {
+				// 다른 프로세스가 조회 중이면 그 결과는 다음 동기화(30초)에서 받음
+				if (shared) apply(shared);
+				return;
+			}
+			try {
+				panel.loading = true;
+				rerender?.();
+				const rows = await Promise.all([fetchAnthropic(ctx), fetchCodex(ctx)]);
+				const status: Status = { fetchedAt: Date.now(), rows: rows.filter((r): r is Row => r !== null) };
+				record(status);
+				apply(status);
+			} finally {
+				if (leased) withStore((s) => s.release("fetch"));
+			}
 		})().finally(() => {
 			refreshing = undefined;
 		});
 		return refreshing;
+	};
+
+	/** 다른 프로세스가 더 새 결과를 저장했으면 가져옴 */
+	const syncFromStore = () => {
+		if (refreshing) return;
+		const shared = withStore((s) => s.getMeta<Status>("status"));
+		if (shared && shared.fetchedAt > panel.updatedAt) apply(shared);
+	};
+
+	/**
+	 * 세션 기록 증분 수집. 한 프로세스만 수집하도록 'ingest' 임대를 잡음.
+	 * 처음 쌓인 기록이 많으면 한 번에 다 읽지 않고 1초 간격으로 나눠 읽어 pi가 멈추지 않게 함
+	 */
+	const ingest = (): void => {
+		const more = withStore((s) => {
+			if (!s.tryLease("ingest", 120_000)) return false;
+			try {
+				const r = s.ingest();
+				if (!r.more) s.prune();
+				return r.more;
+			} finally {
+				s.release("ingest");
+			}
+		});
+		if (more && visible) setTimeout(ingest, 1_000).unref?.();
 	};
 
 	// /login이 끝나면 auth.json이 바뀌므로, 로그인이 필요한 계정이 있거나 계정 목록이 달라졌을 때만 다시 조회
@@ -322,14 +465,15 @@ export default function (pi: ExtensionAPI) {
 		const auth = readAuthFile();
 		const configured = PROVIDERS.filter((p) => auth[p.id]).map((p) => p.id).join(",");
 		const shown = panel.rows.map((r) => r.id).join(",");
-		if (configured !== shown || panel.rows.some((r) => r.needsLogin)) void refresh(ctx);
+		if (configured !== shown || panel.rows.some((r) => r.needsLogin)) void refresh(ctx, true);
 	};
 
 	const stopTimers = () => {
 		if (timer) clearInterval(timer);
 		if (tick) clearInterval(tick);
 		if (authWatch) clearInterval(authWatch);
-		timer = tick = authWatch = undefined;
+		if (ingestTimer) clearInterval(ingestTimer);
+		timer = tick = authWatch = ingestTimer = undefined;
 	};
 
 	// ── 로그인 ──
@@ -421,11 +565,19 @@ export default function (pi: ExtensionAPI) {
 		authStamp = authFingerprint();
 		void refresh(ctx);
 		timer = setInterval(() => void refresh(ctx), REFRESH_MS);
-		tick = setInterval(() => rerender?.(), 30_000); // 남은 시간 표시 갱신
+		// 남은 시간 표시를 갱신하고, 다른 프로세스가 저장한 더 새 조회 결과를 가져옴
+		tick = setInterval(() => {
+			syncFromStore();
+			rerender?.();
+		}, 30_000);
 		authWatch = setInterval(() => watchAuth(ctx), 3_000);
+		// 세션 기록 수집은 시작 직후를 피해 조금 뒤에 처음 실행하고, 이후 1분마다 실행
+		setTimeout(ingest, 5_000).unref?.();
+		ingestTimer = setInterval(ingest, 60_000);
 		timer.unref?.();
 		tick.unref?.();
 		authWatch.unref?.();
+		ingestTimer.unref?.();
 	};
 
 	const hide = () => {
@@ -562,7 +714,7 @@ export default function (pi: ExtensionAPI) {
 				await startLogin(ctx, provider?.id);
 			} else if (verb === "refresh") {
 				if (!visible) show(ctx);
-				else await refresh(ctx);
+				else await refresh(ctx, true);
 			} else toggle(ctx);
 		},
 	});
@@ -570,5 +722,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_shutdown", () => {
 		stopTimers();
 		close?.();
+		store?.close();
+		store = undefined;
 	});
 }

@@ -1,6 +1,6 @@
 {
   "name": "pi-quota-panel",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Top-right pi overlay showing Claude and OpenAI Codex 5h/7d usage limits and time to reset.",
   "type": "module",
   "license": "MIT",

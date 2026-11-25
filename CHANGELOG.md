@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.0
+
+- Collection no longer depends on the panel: every interactive (TUI) pi session starts the collector at session start, so history, diagnosis and spike warnings keep working while the panel is hidden. The panel still starts hidden, and `/quota off` only hides it.
+- Status line summary (`Claude 5h 42% +22%/h 19:01 소진 큰 컨텍스트 반복 · Codex 7d 77%`) in every TUI session, including custom footers that show extension statuses.
+- Session-log ingest is skipped when another pi process finished one less than 50 seconds ago, so the logs are scanned once a minute per machine. The usage fetch stays at one call every 3 minutes per machine.
+- RPC, JSON and print runs (such as subagent children) never start the collector.
+- After `/new`, `/resume` or `/fork` the panel comes back if it was shown.
+
 ## 0.4.0
 
 - Cause of usage spikes: when the 5-hour usage rises 5+ points in 15 minutes or a window would run out before reset, the panel shows the main pattern of the last hour (`원인: …`), and the session responsible for 20%+ of the cost gets a warning with the action to take.

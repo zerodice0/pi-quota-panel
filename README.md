@@ -30,11 +30,19 @@ Accounts are read from pi's own login (`/login`). Providers you are not logged i
 
 ## Usage
 
+The panel starts hidden. Collection, the status line and spike warnings run in every interactive (TUI) pi session whether or not the panel is shown:
+
+```
+Claude 5h 42% +22%/h 19:01 소진 큰 컨텍스트 반복 · Codex 7d 77%
+```
+
+The status line shows each account's 5-hour usage (7-day when there is no 5-hour window), the burn rate while it is rising, the projected exhaustion time when the window would run out before it resets, and the cause of a spike.
+
 | Action | How |
 |---|---|
 | Toggle the panel | `ctrl+shift+u`, `alt+u` or `/quota` |
 | Show / hide | `/quota on`, `/quota off` |
-| Refresh now | `/quota refresh` (refreshes every 3 minutes otherwise) |
+| Refresh now | `/quota refresh` (refreshes every 3 minutes otherwise, also while hidden) |
 | Move with the keyboard | `/quota move`, then arrow keys or `hjkl` (`shift` for bigger steps), `r` for the default position, `enter` to save, `esc` to cancel |
 | Move in one step | `/quota move left\|right\|up\|down [cells]`, `/quota move top-left\|top-right\|bottom-left\|bottom-right` |
 | Move with the mouse | Drag the panel (fullscreen mode only) |
@@ -56,13 +64,13 @@ History lives in a small SQLite database, `~/.pi/agent/quota-panel.db`, through 
 
 - `quota_samples`: every 5h/7d utilization the panel fetched.
 - `turns`: per-turn token counts and cost collected incrementally from pi's session logs (`~/.pi/agent/sessions`, subagent runs included). Message content is never stored.
-- `lease`: several pi sessions on one machine share the database, and only one of them calls the usage API or reads the session logs at a time. The others reuse the shared result, so opening many panes does not multiply API calls.
+- `lease`: several pi sessions on one machine share the database. Every TUI session runs the timers, but a lease plus a freshness check (`meta.status` for the usage fetch, `meta.ingested_at` for the session logs) means the usage API is called once every 3 minutes and the session logs are scanned once a minute per machine, however many panes are open. RPC, JSON and print runs (for example subagent children) never start the collector.
 
 Records older than 60 days are removed. If `node:sqlite` is unavailable the panel still works, without the burn rate. The database only covers this machine; usage from other machines or from Claude Code / Codex CLI counts against the same limits but is not in the logs.
 
 ## Finding the cause of a spike
 
-When the 5-hour usage rises by 5 points or more within 15 minutes, or either window would run out before it resets, the panel analyzes the last hour of this machine's pi sessions and adds a `원인:` line with the main pattern. If the current session accounts for at least 20% of that hour's cost, it also shows a warning with the action to take (at most once every 30 minutes per account).
+When the 5-hour usage rises by 5 points or more within 15 minutes, or either window would run out before it resets, the panel analyzes the last hour of this machine's pi sessions and adds a `원인:` line with the main pattern (also shown in the status line while the panel is hidden). If the current session accounts for at least 20% of that hour's cost, it also shows a warning with the action to take (at most once every 30 minutes per account).
 
 `/quota why` opens the full analysis: the usage rise, the main cause and the action, other causes, the top sessions (the current one is marked), the cost split, context size, models and tools. `tab` switches accounts, `←`/`→` change the range, `esc` closes it.
 

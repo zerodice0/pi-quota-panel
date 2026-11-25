@@ -273,6 +273,29 @@ function whyLines(r: Report | undefined, rangeLabel: string): string[] {
 /** 지금 속도로는 리셋 전에 100%에 닿음 */
 const isDanger = (w: Win) => !!w?.trend?.eta && w.trend.rate > 0 && w.trend.eta < w.resetAt;
 
+/**
+ * 하단 상태줄 한 줄 요약. 계정마다 5h 구간(없으면 7d)의 사용률을 보이고, 늘고 있으면 속도를,
+ * 리셋 전에 소진될 속도면 소진 예상 시각을 붙임. 예: "Claude 5h 42% +22%/h 19:01 소진 · Codex 7d 77%"
+ */
+function statusText(rows: Row[]): string | undefined {
+	if (!rows.length) return undefined;
+	const parts = rows.map((r) => {
+		const name = fg(C.name, r.name);
+		if (r.error) return `${name} ${fg(r.needsLogin ? C.warn : C.crit, r.needsLogin ? "로그인 필요" : "조회 실패")}`;
+		const [label, w] = r.h5 ? (["5h", r.h5] as const) : (["7d", r.d7] as const);
+		if (!w) return `${name} ${fg(C.dim, "기록 없음")}`;
+		let text = `${name} ${fg(C.label, label)} ${fg(levelColor(w.pct), `${Math.round(w.pct)}%`)}`;
+		const t = trendText(w);
+		if (t) {
+			const rate = t.text.split(" · ")[0];
+			text += ` ${fg(t.danger ? C.crit : C.dim, t.danger ? `${rate} ${clock(w.trend!.eta!)} 소진` : rate)}`;
+		}
+		if (r.cause) text += ` ${fg(C.warn, r.cause)}`;
+		return text;
+	});
+	return parts.join(fg(C.dim, " · "));
+}
+
 type Position = { offsetX: number; offsetY: number };
 
 function readPosition(): Position {
@@ -368,6 +391,7 @@ const VERBS = [
 	{ value: "login", description: "계정 로그인 (/login 명령을 입력창에 채움)" },
 	{ value: "why", description: "사용량 급증 원인 분석 (계정, 기간: 30m|1h|3h|5h|24h)" },
 ];
+const STATUS_KEY = "quota-panel";
 const MOVE_ARGS = ["left", "right", "up", "down", "top-left", "top-right", "bottom-left", "bottom-right"];
 
 export default function (pi: ExtensionAPI) {
@@ -398,7 +422,12 @@ export default function (pi: ExtensionAPI) {
 	let authStamp = "";
 	let refreshing: Promise<void> | undefined;
 	let ingestTimer: ReturnType<typeof setInterval> | undefined;
+	let ingestKick: ReturnType<typeof setTimeout> | undefined;
 	let visible = false;
+	/** 수집 타이머가 돌고 있는지. 패널 표시와는 별개로 TUI 세션이 시작되면 켜짐 */
+	let collecting = false;
+	/** 세션 전환(/new, /resume 등) 뒤에도 패널을 다시 띄우기 위해 직전 표시 상태를 기억 */
+	let wasVisible = false;
 	// undefined: 아직 열지 않음, null: node:sqlite를 쓸 수 없어 이력 없이 동작
 	let store: Store | null | undefined;
 	const getStore = () => {
@@ -505,6 +534,10 @@ export default function (pi: ExtensionAPI) {
 		panel.updatedAt = status.fetchedAt;
 		panel.loading = false;
 		rerender?.();
+		// 패널을 숨겨도 하단 상태줄에서 사용률과 급증 여부를 볼 수 있게 함
+		try {
+			lastCtx?.ui.setStatus(STATUS_KEY, statusText(panel.rows));
+		} catch {}
 	};
 
 	const record = (status: Status) =>
@@ -565,11 +598,13 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	/**
-	 * 세션 기록 증분 수집. 한 프로세스만 수집하도록 'ingest' 임대를 잡음.
+	 * 세션 기록 증분 수집. 한 프로세스만 수집하도록 'ingest' 임대를 잡고, 다른 프로세스가 50초 안에
+	 * 수집을 끝냈으면 건너뜀(기기 전체에서 1분에 한 번만 세션 파일을 훑음). force는 /quota why처럼 지금 바로 최신이어야 할 때.
 	 * 처음 쌓인 기록이 많으면 한 번에 다 읽지 않고 1초 간격으로 나눠 읽어 pi가 멈추지 않게 함
 	 */
-	const ingest = (): void => {
+	const ingest = (force = false): void => {
 		const r = withStore((s) => {
+			if (!force && Date.now() - (s.getMeta<number>("ingested_at") ?? 0) < 50_000) return undefined;
 			if (!s.tryLease("ingest", 120_000)) return undefined;
 			try {
 				const r = s.ingest();
@@ -585,7 +620,7 @@ export default function (pi: ExtensionAPI) {
 		});
 		// 새 턴이 들어왔으면 원인 진단을 다시 함(시작 직후 수집 전에 진단해 '외부 사용'으로 잘못 보이는 것 방지)
 		if (r?.added && lastStatus) apply(lastStatus);
-		if (r?.more && visible) setTimeout(ingest, 1_000).unref?.();
+		if (r?.more && collecting) setTimeout(() => ingest(), 1_000).unref?.();
 	};
 
 	// /login이 끝나면 auth.json이 바뀌므로, 로그인이 필요한 계정이 있거나 계정 목록이 달라졌을 때만 다시 조회
@@ -611,7 +646,40 @@ export default function (pi: ExtensionAPI) {
 		if (tick) clearInterval(tick);
 		if (authWatch) clearInterval(authWatch);
 		if (ingestTimer) clearInterval(ingestTimer);
-		timer = tick = authWatch = ingestTimer = undefined;
+		if (ingestKick) clearTimeout(ingestKick);
+		timer = tick = authWatch = ingestTimer = ingestKick = undefined;
+	};
+
+	// ── 수집 ──
+	/**
+	 * 패널을 숨겨도 이력 수집과 급증 경고가 이어지도록, TUI 세션이 시작되면 수집 타이머를 켬.
+	 * 같은 기기의 pi 프로세스마다 타이머가 돌지만 'fetch'·'ingest' 임대와 최신 여부 검사 때문에
+	 * 실제 API 조회(3분)와 세션 기록 수집(1분)은 기기 전체에서 한 번씩만 일어남.
+	 * RPC·print 모드(pi-subagents 자식 등)에서는 켜지 않음
+	 */
+	const startCollector = (ctx: ExtensionContext) => {
+		lastCtx = ctx;
+		if (collecting) return;
+		collecting = true;
+		authStamp = authFingerprint();
+		// 공유 결과가 최신이면 API를 부르지 않고 그 결과를 씀
+		void refresh(ctx);
+		timer = setInterval(() => void refresh(ctx), REFRESH_MS);
+		// 남은 시간 표시를 갱신하고, 다른 프로세스가 저장한 더 새 결과와 수집한 턴으로 다시 진단함
+		tick = setInterval(() => {
+			syncFromStore();
+			rerender?.();
+		}, 30_000);
+		authWatch = setInterval(() => watchAuth(ctx), 3_000);
+		// 세션 기록 수집은 시작 직후를 피해 조금 뒤에 처음 실행하고, 이후 1분마다 실행
+		ingestKick = setTimeout(() => ingest(), 5_000);
+		ingestTimer = setInterval(() => ingest(), 60_000);
+		for (const t of [timer, tick, authWatch, ingestKick, ingestTimer]) t.unref?.();
+	};
+
+	const stopCollector = () => {
+		stopTimers();
+		collecting = false;
 	};
 
 	// ── 로그인 ──
@@ -702,28 +770,15 @@ export default function (pi: ExtensionAPI) {
 				panel.moving = false;
 			});
 		}
-		stopTimers();
-		authStamp = authFingerprint();
+		// 패널을 켤 때는 수집 상태와 상관없이 바로 최신 결과를 보여 줌(공유 결과가 최신이면 API는 부르지 않음)
+		if (ctx.mode === "tui") startCollector(ctx);
+		if (lastStatus) apply(lastStatus);
 		void refresh(ctx);
-		timer = setInterval(() => void refresh(ctx), REFRESH_MS);
-		// 남은 시간 표시를 갱신하고, 다른 프로세스가 저장한 더 새 조회 결과를 가져옴
-		tick = setInterval(() => {
-			syncFromStore();
-			rerender?.();
-		}, 30_000);
-		authWatch = setInterval(() => watchAuth(ctx), 3_000);
-		// 세션 기록 수집은 시작 직후를 피해 조금 뒤에 처음 실행하고, 이후 1분마다 실행
-		setTimeout(ingest, 5_000).unref?.();
-		ingestTimer = setInterval(ingest, 60_000);
-		timer.unref?.();
-		tick.unref?.();
-		authWatch.unref?.();
-		ingestTimer.unref?.();
 	};
 
+	// 패널만 숨기고 수집과 경고는 계속함
 	const hide = () => {
 		visible = false;
-		stopTimers();
 		handle?.setHidden(true);
 	};
 
@@ -738,7 +793,7 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		// 방금 쓴 턴까지 반영되도록 먼저 수집
-		ingest();
+		ingest(true);
 		const ids = PROVIDERS.map((p) => p.id);
 		// 계정을 고르지 않았으면 원인이 표시된 계정, 없으면 최근 1시간에 비용이 가장 큰 계정
 		let index = ids.indexOf(
@@ -932,9 +987,22 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	pi.on("session_start", (event, ctx) => {
+		if (ctx.mode !== "tui") return;
+		startCollector(ctx);
+		// 같은 확장 인스턴스에서 세션만 바뀐 경우(/new, /resume, /fork) 패널을 켜 두었으면 다시 띄움
+		if (wasVisible && event.reason !== "startup") show(ctx);
+		wasVisible = false;
+	});
+
 	pi.on("session_shutdown", () => {
-		stopTimers();
+		wasVisible = visible;
+		visible = false;
+		stopCollector();
 		close?.();
+		try {
+			lastCtx?.ui.setStatus(STATUS_KEY, undefined);
+		} catch {}
 		store?.close();
 		store = undefined;
 	});

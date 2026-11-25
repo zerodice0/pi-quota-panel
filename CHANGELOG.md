@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.0
+
+- Cause of usage spikes: when the 5-hour usage rises 5+ points in 15 minutes or a window would run out before reset, the panel shows the main pattern of the last hour (`원인: …`), and the session responsible for 20%+ of the cost gets a warning with the action to take.
+- `/quota why [claude|codex] [30m|1h|3h|5h|24h]` shows the analysis: usage rise, main and other causes with actions, top sessions, cost split, context size, models and tools. In fullscreen mode, clicking the `원인:` row opens it.
+- Patterns: large repeated context, short-turn loops, parallel sessions, cache misses, heavy output, usage from elsewhere and premium models.
+- The `turns` table now keeps cost per input, output, cache read and cache write.
+
 ## 0.3.0
 
 - Burn rate under each window (`%/h` for 5h, `%/일` for 7d) with the projected exhaustion time when the window would run out before it resets.

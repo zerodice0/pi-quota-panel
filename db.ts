@@ -21,6 +21,25 @@ export const dbFile = join(homedir(), ".pi/agent/quota-panel.db");
 export const sessionsDir = join(homedir(), ".pi/agent/sessions");
 
 export type WindowKey = "5h" | "7d";
+export type TurnRow = {
+	sessionFile: string;
+	ts: number;
+	project: string;
+	agent: string;
+	kind: string;
+	provider: string | null;
+	model: string | null;
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+	cost: number;
+	costInput: number;
+	costOutput: number;
+	costCacheRead: number;
+	costCacheWrite: number;
+	tools: string | null;
+};
 export type Sample = { at: number; pct: number };
 
 function loadSqlite(): typeof import("node:sqlite") | undefined {
@@ -105,6 +124,17 @@ export class Store {
 		).map((r) => ({ at: Number(r.at), pct: Number(r.pct) }));
 	}
 
+	/** 기간 안의 턴. provider를 주면 그 공급자의 턴만 */
+	turnsBetween(from: number, to: number, provider?: string): TurnRow[] {
+		const sql = `SELECT session_file AS sessionFile, ts, project, agent, kind, provider, model, input, output,
+			cache_read AS cacheRead, cache_write AS cacheWrite, cost, cost_input AS costInput, cost_output AS costOutput,
+			cost_cache_read AS costCacheRead, cost_cache_write AS costCacheWrite, tools
+			FROM turns WHERE ts >= ? AND ts <= ?${provider ? " AND provider = ?" : ""} ORDER BY ts`;
+		const args: (string | number)[] = [from, to];
+		if (provider) args.push(provider);
+		return (this.db.prepare(sql).all(...args) as TurnRow[]).map((r) => ({ ...r, ts: Number(r.ts) }));
+	}
+
 	transaction(fn: () => void) {
 		this.db.exec("BEGIN IMMEDIATE");
 		try {
@@ -133,8 +163,9 @@ export class Store {
 		);
 		const insertTurn = this.db.prepare(
 			`INSERT OR IGNORE INTO turns(session_file, entry_id, ts, project, agent, kind, provider, model,
-				input, output, cache_read, cache_write, reasoning, cost, stop_reason, duration_ms, tools)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				input, output, cache_read, cache_write, reasoning, cost, cost_input, cost_output, cost_cache_read,
+				cost_cache_write, stop_reason, duration_ms, tools)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		);
 		const saveOffset = this.db.prepare(
 			`INSERT INTO file_offsets(session_file, offset, mtime, project, agent) VALUES (?, ?, ?, ?, ?)
@@ -218,6 +249,10 @@ export class Store {
 						turn.cacheWrite,
 						turn.reasoning,
 						turn.cost,
+						turn.costInput,
+						turn.costOutput,
+						turn.costCacheRead,
+						turn.costCacheWrite,
 						turn.stopReason,
 						turn.durationMs,
 						turn.tools,
@@ -261,6 +296,10 @@ type Turn = {
 	cacheWrite: number;
 	reasoning: number;
 	cost: number;
+	costInput: number;
+	costOutput: number;
+	costCacheRead: number;
+	costCacheWrite: number;
 	stopReason: string | null;
 	durationMs: number | null;
 	tools: string | null;
@@ -277,6 +316,10 @@ function toTurn(e: any): Turn | undefined {
 		cacheWrite: num(u?.cacheWrite),
 		reasoning: num(u?.reasoning),
 		cost: num(u?.cost?.total),
+		costInput: num(u?.cost?.input),
+		costOutput: num(u?.cost?.output),
+		costCacheRead: num(u?.cost?.cacheRead),
+		costCacheWrite: num(u?.cost?.cacheWrite),
 	});
 	if (e.type === "message" && e.message?.role === "assistant" && e.message.usage && typeof e.id === "string") {
 		const m = e.message;
@@ -364,6 +407,10 @@ CREATE TABLE IF NOT EXISTS turns (
 	cache_write INTEGER NOT NULL,
 	reasoning INTEGER NOT NULL,
 	cost REAL NOT NULL,
+	cost_input REAL NOT NULL,
+	cost_output REAL NOT NULL,
+	cost_cache_read REAL NOT NULL,
+	cost_cache_write REAL NOT NULL,
 	stop_reason TEXT,
 	duration_ms INTEGER,
 	tools TEXT,

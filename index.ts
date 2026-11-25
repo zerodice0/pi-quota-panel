@@ -5,11 +5,12 @@
  */
 import { readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { KeyId, OverlayHandle, OverlayOptions, TUI, TuiMouseEvent } from "@earendil-works/pi-tui";
 import { Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { openStore, type Sample, type Store, type WindowKey } from "./db.ts";
+import { openStore, type Sample, sessionsDir, type Store, type WindowKey } from "./db.ts";
+import { analyze, kTokens, percent, type Report, riseOf } from "./diagnose.ts";
 
 // ── titanium 팔레트 ──────────────────────────────────────────
 const rgb = (hex: string) => {
@@ -55,7 +56,8 @@ const PROVIDERS: { id: ProviderId; name: string; aliases: string[] }[] = [
 type Trend = { rate: number; unit: "h" | "d"; eta?: number };
 type Win = { pct: number; resetAt: number; trend?: Trend } | null;
 type Status = { fetchedAt: number; rows: Row[] };
-type Row = { id: ProviderId; name: string; h5: Win; d7: Win; error?: string; needsLogin?: boolean };
+/** cause는 사용량이 급증하거나 리셋 전에 소진될 때만 채움(패널의 '원인:' 줄) */
+type Row = { id: ProviderId; name: string; h5: Win; d7: Win; error?: string; needsLogin?: boolean; cause?: string };
 
 /** 다시 로그인해야 풀리는 오류(토큰 없음·만료, HTTP 401/403) */
 class LoginError extends Error {}
@@ -206,9 +208,70 @@ function trendText(w: NonNullable<Win>): { text: string; danger: boolean } | und
 	if (!t || t.rate <= 0) return undefined;
 	const value = t.rate >= 10 ? Math.round(t.rate) : Math.round(t.rate * 10) / 10;
 	const rate = `+${value}%/${t.unit === "h" ? "h" : "일"}`;
-	const danger = t.eta !== undefined && t.eta < w.resetAt;
+	const danger = isDanger(w);
 	return { text: danger ? `${rate} · ${clock(t.eta!)} 소진 예상` : `${rate} · 리셋까지 여유`, danger };
 }
+
+// ── 원인 분석 화면 ──────────────────────────────────────────
+const WHY_RANGES = [
+	{ ms: 30 * 60_000, label: "최근 30분", arg: "30m" },
+	{ ms: 3600_000, label: "최근 1시간", arg: "1h" },
+	{ ms: 3 * 3600_000, label: "최근 3시간", arg: "3h" },
+	{ ms: 5 * 3600_000, label: "최근 5시간", arg: "5h" },
+	{ ms: 24 * 3600_000, label: "최근 24시간", arg: "24h" },
+];
+
+const hm = (ts: number, ref = ts) => {
+	const d = new Date(ts);
+	const time = `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+	// 기준 시각과 날짜가 다르면 날짜를 붙임(예: 24일 16:22)
+	return d.toDateString() === new Date(ref).toDateString() ? time : `${d.getDate()}일 ${time}`;
+};
+
+/** 왼쪽 제목 열(한글 폭을 고려해 너비 11칸에 맞춤) */
+const col = (label: string) => fg(C.label, label + " ".repeat(Math.max(1, 11 - visibleWidth(label))));
+
+function whyLines(r: Report | undefined, rangeLabel: string): string[] {
+	if (!r) return [fg(C.crit, "이력 DB를 읽을 수 없습니다")];
+	const out = [`${bold(fg(C.title, "사용량 원인 분석"))} · ${r.name} · ${rangeLabel} (${hm(r.from, r.to)}–${hm(r.to)})`];
+	const delta = r.delta === undefined ? "5h 표본 없음" : `5h +${Math.round(r.delta)}%p`;
+	// 가격 정보가 없는 모델은 달러 대신 가중 토큰으로 표시
+	const amount = (v: number) => (r.priced ? `$${v.toFixed(2)}` : `${kTokens(v)} 가중 토큰`);
+	out.push(
+		`${col("사용량")}${delta} · ${r.priced ? "비용 환산 " : ""}${amount(r.cost)} · ${r.turns}턴 · 세션 ${r.activeSessions}개(최대 동시 ${r.peakConcurrency}개)`,
+	);
+	if (!r.turns && !r.causes.length) {
+		out.push(`${col("")}${fg(C.dim, "이 기간에는 이 기기의 pi 기록이 없습니다")}`);
+		return out;
+	}
+	const [main, ...others] = r.causes;
+	if (main) {
+		out.push(`${col("주원인")}${fg(C.warn, main.label)}: ${main.evidence}`);
+		out.push(`${col("조치")}${fg(C.ok, main.action)}`);
+	} else out.push(`${col("주원인")}${fg(C.dim, "뚜렷한 원인 없음")}`);
+	others.slice(0, 3).forEach((c, i) => {
+		out.push(`${col(i === 0 ? "다른 요인" : "")}${fg(C.warn, c.label)}: ${c.evidence} → ${c.action}`);
+	});
+	r.sessions.slice(0, 3).forEach((s, i) => {
+		const mine = s.current ? fg(C.ok, "  ← 이 세션") : "";
+		out.push(
+			`${col(i === 0 ? "상위 세션" : "")}${s.label}  ${fg(C.dim, `${amount(s.cost)} · ${s.turns}턴 · 평균 ${kTokens(s.avgCtx)}`)}${mine}`,
+		);
+	});
+	const sp = r.split;
+	out.push(
+		`${col("비용 구성")}캐시 읽기 ${percent(sp.cacheRead)} · 캐시 쓰기 ${percent(sp.cacheWrite)} · 출력 ${percent(sp.output)} · 입력 ${percent(sp.input)}`,
+	);
+	out.push(
+		`${col("컨텍스트")}평균 ${kTokens(r.avgCtx)} · 최대 ${kTokens(r.maxCtx)} · 분당 ${r.turnsPerMin.toFixed(1)}턴 · 턴당 출력 ${r.medianOutput}토큰(중앙값)`,
+	);
+	if (r.models.length) out.push(`${col("모델")}${r.models.slice(0, 3).map(([m, s]) => `${m} ${percent(s)}`).join(" · ")}`);
+	if (r.tools.length) out.push(`${col("도구")}${r.tools.slice(0, 5).map(([t, n]) => `${t} ${n}`).join(" · ")}`);
+	return out;
+}
+
+/** 지금 속도로는 리셋 전에 100%에 닿음 */
+const isDanger = (w: Win) => !!w?.trend?.eta && w.trend.rate > 0 && w.trend.eta < w.resetAt;
 
 type Position = { offsetX: number; offsetY: number };
 
@@ -231,6 +294,8 @@ class QuotaPanel {
 	moving = false;
 	/** 클릭하면 로그인을 시작하는 줄 → 대상 계정(null이면 계정 선택) */
 	loginLines = new Map<number, Row | null>();
+	/** 클릭하면 원인 분석을 여는 줄 → 대상 계정 */
+	whyLines = new Map<number, Row>();
 
 	invalidate() {}
 
@@ -249,6 +314,7 @@ class QuotaPanel {
 		];
 
 		this.loginLines.clear();
+		this.whyLines.clear();
 		out.push(line("")); // 위쪽 여백
 		if (!this.rows.length) {
 			out.push(line(fg(C.dim, this.loading ? "불러오는 중…" : "로그인된 계정이 없습니다")));
@@ -280,6 +346,10 @@ class QuotaPanel {
 				const t = w && trendText(w);
 				if (t) out.push(line(`${" ".repeat(7)}${fg(t.danger ? C.crit : C.dim, t.text)}`));
 			});
+			if (r.cause) {
+				this.whyLines.set(out.length, r);
+				out.push(line(`${" ".repeat(7)}${fg(C.warn, `원인: ${r.cause}`)}`));
+			}
 		});
 
 		out.push(line("")); // 아래쪽 여백
@@ -296,6 +366,7 @@ const VERBS = [
 	{ value: "move", description: "키보드로 위치 이동 (방향키, enter 저장)" },
 	{ value: "reset", description: "기본 위치(오른쪽 위)로 되돌림" },
 	{ value: "login", description: "계정 로그인 (/login 명령을 입력창에 채움)" },
+	{ value: "why", description: "사용량 급증 원인 분석 (계정, 기간: 30m|1h|3h|5h|24h)" },
 ];
 const MOVE_ARGS = ["left", "right", "up", "down", "top-left", "top-right", "bottom-left", "bottom-right"];
 
@@ -334,7 +405,7 @@ export default function (pi: ExtensionAPI) {
 		if (store === undefined) store = openStore() ?? null;
 		return store ?? undefined;
 	};
-	// DB 오류(잠금 대기 초과 등)로 pi가 멈추거나 죽지 않도록 모든 저장소 호출을 감쌌
+	// DB 오류(잠금 대기 초과 등)로 pi가 멈추거나 죽지 않도록 모든 저장소 호출을 감쌈
 	const withStore = <T>(fn: (s: Store) => T): T | undefined => {
 		const s = getStore();
 		if (!s) return undefined;
@@ -359,12 +430,68 @@ export default function (pi: ExtensionAPI) {
 	};
 	const moveBy = (dx: number, dy: number) => placeAt((options.offsetX ?? 0) + dx, (options.offsetY ?? 0) + dy);
 
+	// ── 원인 진단 ──
+	/** 이 pi 세션의 기록 파일(turns.session_file과 같은 형식). 상위 세션에서 '이 세션'을 표시하고 알림 대상을 고를 때 씀 */
+	const currentSession = () => {
+		try {
+			const file = lastCtx?.sessionManager.getSessionFile();
+			return file ? relative(sessionsDir, file) : undefined;
+		} catch {
+			return undefined;
+		}
+	};
+
+	const buildReport = (id: ProviderId, from: number, to: number): Report | undefined =>
+		withStore((s) =>
+			analyze({
+				provider: id,
+				name: PROVIDERS.find((p) => p.id === id)?.name ?? id,
+				from,
+				to,
+				turns: s.turnsBetween(from, to, id),
+				samples: s.samples(id, "5h", from).filter((x) => x.at <= to),
+				currentSession: currentSession(),
+			}),
+		);
+
+	// 같은 계정의 알림은 프로세스마다 30분에 한 번만
+	const alertedAt = new Map<ProviderId, number>();
+
+	/**
+	 * 급증(최근 15분에 5h 사용률 +5%p 이상)이거나 리셋 전에 소진될 속도면 최근 1시간을 진단해 패널에 원인을 표시함.
+	 * 알림은 이 세션이 그 구간 비용의 20% 이상을 차지할 때만 띄움. 모든 pi가 동시에 알리지 않고, 원인을 만든 세션에서만 알림
+	 */
+	const diagnose = (row: Row, now: number) => {
+		if (row.error) return;
+		const recent = withStore((s) => s.samples(row.id, "5h", now - 15 * 60_000)) ?? [];
+		const surge = (riseOf(recent) ?? 0) >= 5;
+		if (!surge && !isDanger(row.h5) && !isDanger(row.d7)) return;
+		// 처음 수집 중이거나 수집이 멈춘 상태에서 진단하면 일부 기록만 보고 원인을 잘못 짚으므로 건너뜀
+		const ingestedAt = withStore((s) => s.getMeta<number>("ingested_at")) ?? 0;
+		if (now - ingestedAt > 3 * 60_000) return;
+		const report = buildReport(row.id, now - 3600_000, now);
+		if (!report) return;
+		const cause = report.causes[0];
+		row.cause = cause?.label ?? "뚜렷한 원인 없음";
+
+		const mine = report.sessions.find((s) => s.current);
+		if (!cause || !mine || !lastCtx?.hasUI || report.cost <= 0 || mine.cost / report.cost < 0.2) return;
+		if (now - (alertedAt.get(row.id) ?? 0) < 30 * 60_000) return;
+		alertedAt.set(row.id, now);
+		lastCtx.ui.notify(
+			`${row.name} 사용량 급증: ${cause.label}. 이 세션이 최근 1시간 비용의 ${percent(mine.cost / report.cost)}를 차지합니다. ${cause.action}. 자세한 내용은 /quota why`,
+			"warning",
+		);
+	};
+
 	// ── 조회 ──
-	// 조회 결과를 패널에 반영하고, 저장된 표본으로 소모 속도를 붙임
+	// 조회 결과를 패널에 반영하고, 저장된 표본으로 소모 속도와 원인을 붙임
+	let lastStatus: Status | undefined;
 	const apply = (status: Status) => {
+		lastStatus = status;
 		const now = Date.now();
 		panel.rows = status.rows.map((r) => {
-			const row: Row = { ...r };
+			const row: Row = { ...r, cause: undefined };
 			for (const key of ["5h", "7d"] as const) {
 				const prop = key === "5h" ? "h5" : "d7";
 				const w = row[prop];
@@ -372,6 +499,7 @@ export default function (pi: ExtensionAPI) {
 				const samples = withStore((s) => s.samples(r.id, key, now - TREND[key].span)) ?? [];
 				row[prop] = { pct: w.pct, resetAt: w.resetAt, trend: trendOf(samples, w, key) };
 			}
+			diagnose(row, now);
 			return row;
 		});
 		panel.updatedAt = status.fetchedAt;
@@ -425,11 +553,15 @@ export default function (pi: ExtensionAPI) {
 		return refreshing;
 	};
 
-	/** 다른 프로세스가 더 새 결과를 저장했으면 가져옴 */
+	/**
+	 * 다른 프로세스가 더 새 결과를 저장했으면 가져옴. 새 결과가 없어도 다시 적용해서,
+	 * 다른 프로세스가 수집한 턴으로 원인 진단을 갱신함
+	 */
 	const syncFromStore = () => {
 		if (refreshing) return;
 		const shared = withStore((s) => s.getMeta<Status>("status"));
 		if (shared && shared.fetchedAt > panel.updatedAt) apply(shared);
+		else if (lastStatus) apply(lastStatus);
 	};
 
 	/**
@@ -437,17 +569,23 @@ export default function (pi: ExtensionAPI) {
 	 * 처음 쌓인 기록이 많으면 한 번에 다 읽지 않고 1초 간격으로 나눠 읽어 pi가 멈추지 않게 함
 	 */
 	const ingest = (): void => {
-		const more = withStore((s) => {
-			if (!s.tryLease("ingest", 120_000)) return false;
+		const r = withStore((s) => {
+			if (!s.tryLease("ingest", 120_000)) return undefined;
 			try {
 				const r = s.ingest();
-				if (!r.more) s.prune();
-				return r.more;
+				if (!r.more) {
+					s.prune();
+					// 세션 기록을 끝까지 수집한 시각. 원인 진단은 이 값이 최근일 때만 함
+					s.setMeta("ingested_at", Date.now());
+				}
+				return r;
 			} finally {
 				s.release("ingest");
 			}
 		});
-		if (more && visible) setTimeout(ingest, 1_000).unref?.();
+		// 새 턴이 들어왔으면 원인 진단을 다시 함(시작 직후 수집 전에 진단해 '외부 사용'으로 잘못 보이는 것 방지)
+		if (r?.added && lastStatus) apply(lastStatus);
+		if (r?.more && visible) setTimeout(ingest, 1_000).unref?.();
 	};
 
 	// /login이 끝나면 auth.json이 바뀌므로, 로그인이 필요한 계정이 있거나 계정 목록이 달라졌을 때만 다시 조회
@@ -523,6 +661,9 @@ export default function (pi: ExtensionAPI) {
 							if (event.type === "click") {
 								const target = panel.loginLines.get(event.y);
 								if (target !== undefined && lastCtx) void startLogin(lastCtx, target?.id);
+								// '원인:' 줄을 누르면 그 계정의 원인 분석을 엶
+								const why = panel.whyLines.get(event.y);
+								if (why && lastCtx) void showWhy(lastCtx, why.id);
 								return { handled: true };
 							}
 							if (event.type === "press" && event.button === "left") {
@@ -587,6 +728,55 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	const toggle = (ctx: ExtensionContext) => (visible ? hide() : show(ctx));
+
+	// ── 원인 분석 화면(/quota why) ──
+	let whyOpen = false;
+	const showWhy = async (ctx: ExtensionContext, id?: ProviderId, rangeMs?: number) => {
+		if (whyOpen) return;
+		if (!getStore()) {
+			ctx.ui.notify("이력 DB를 열 수 없어 원인을 분석할 수 없습니다 (node:sqlite 필요)", "error");
+			return;
+		}
+		// 방금 쓴 턴까지 반영되도록 먼저 수집
+		ingest();
+		const ids = PROVIDERS.map((p) => p.id);
+		// 계정을 고르지 않았으면 원인이 표시된 계정, 없으면 최근 1시간에 비용이 가장 큰 계정
+		let index = ids.indexOf(
+			id ??
+				panel.rows.find((r) => r.cause)?.id ??
+				ids
+					.map((p) => ({ p, cost: buildReport(p, Date.now() - 3600_000, Date.now())?.cost ?? 0 }))
+					.sort((a, b) => b.cost - a.cost)[0].p,
+		);
+		let range = Math.max(0, WHY_RANGES.findIndex((r) => r.ms === (rangeMs ?? 3600_000)));
+		let report = buildReport(ids[index], Date.now() - WHY_RANGES[range].ms, Date.now());
+		const rebuild = () => {
+			report = buildReport(ids[index], Date.now() - WHY_RANGES[range].ms, Date.now());
+		};
+		whyOpen = true;
+		try {
+			await ctx.ui.custom<void>((t, _theme, _kb, done) => ({
+				render: (width: number) =>
+					[...whyLines(report, WHY_RANGES[range].label), fg(C.dim, "tab 계정 전환 · ←→ 기간 변경 · esc 닫기")].map((l) =>
+						truncateToWidth(l, width),
+					),
+				invalidate() {},
+				handleInput(data: string) {
+					if (matchesKey(data, Key.tab)) index = (index + 1) % ids.length;
+					else if (matchesKey(data, Key.left)) range = Math.max(0, range - 1);
+					else if (matchesKey(data, Key.right)) range = Math.min(WHY_RANGES.length - 1, range + 1);
+					else if (matchesKey(data, Key.escape) || matchesKey(data, Key.enter) || data === "q") {
+						done();
+						return;
+					} else return;
+					rebuild();
+					t.requestRender();
+				},
+			}));
+		} finally {
+			whyOpen = false;
+		}
+	};
 
 	// ── 키보드 이동 모드 ──
 	// 일반 모드에서는 마우스가 터미널 몫이라 드래그가 안 되므로, 방향키로 옮기는 길을 따로 둠
@@ -674,7 +864,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	pi.registerCommand("quota", {
-		description: "사용 한도 패널 (on|off|refresh|move|reset|login, 단축키 ctrl+shift+u / alt+u)",
+		description: "사용 한도 패널 (on|off|refresh|move|reset|login|why, 단축키 ctrl+shift+u / alt+u)",
 		// 입력이 이미 완성된 값이면 목록을 닫아 둠. 목록이 열려 있으면 Enter가 제출 대신 완성에 쓰임
 		getArgumentCompletions: (prefix) => {
 			const [verb, ...rest] = prefix.trimStart().split(/\s+/);
@@ -682,6 +872,13 @@ export default function (pi: ExtensionAPI) {
 				const values = verb === "move" ? MOVE_ARGS : PROVIDERS.map((p) => p.aliases[0]);
 				if (values.includes(rest[0])) return null;
 				return values.filter((v) => v.startsWith(rest[0])).map((v) => ({ value: `${verb} ${v}`, label: v }));
+			}
+			if (verb === "why" && rest.length >= 1 && rest.length <= 2) {
+				const last = rest[rest.length - 1];
+				const values = [...PROVIDERS.map((p) => p.aliases[0]), ...WHY_RANGES.map((r) => r.arg)];
+				if (values.includes(last)) return null;
+				const before = [verb, ...rest.slice(0, -1)].join(" ");
+				return values.filter((v) => v.startsWith(last)).map((v) => ({ value: `${before} ${v}`, label: v }));
 			}
 			if (rest.length || VERBS.some((v) => v.value === verb)) return null;
 			return VERBS.filter((v) => v.value.startsWith(verb)).map((v) => ({ ...v, label: v.value }));
@@ -712,6 +909,22 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				await startLogin(ctx, provider?.id);
+			} else if (verb === "why") {
+				// 인자 순서는 상관없음: /quota why codex 3h, /quota why 30m
+				let provider: ProviderId | undefined;
+				let rangeMs: number | undefined;
+				for (const arg of rest.map((a) => a.toLowerCase())) {
+					const p = PROVIDERS.find((x) => x.aliases.includes(arg));
+					const r = WHY_RANGES.find((x) => x.arg === arg);
+					if (p) provider = p.id;
+					else if (r) rangeMs = r.ms;
+					else {
+						ctx.ui.notify(`알 수 없는 인자: ${arg} (claude, codex, ${WHY_RANGES.map((x) => x.arg).join(", ")})`, "error");
+						return;
+					}
+				}
+				lastCtx ??= ctx;
+				await showWhy(ctx, provider, rangeMs);
 			} else if (verb === "refresh") {
 				if (!visible) show(ctx);
 				else await refresh(ctx, true);

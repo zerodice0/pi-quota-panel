@@ -9,6 +9,7 @@ A [pi](https://github.com/earendil-works/pi) extension that shows a small overla
 │        +18%/h · 19:34 소진 예상        │
 │        7d  █████░░░░░░░  45%  ↻ 1d23h  │
 │        +15%/일 · 리셋까지 여유         │
+│        원인: 큰 컨텍스트 반복          │
 │                                        │
 ╰────────────────────────────────────────╯
 ```
@@ -39,6 +40,7 @@ Accounts are read from pi's own login (`/login`). Providers you are not logged i
 | Move with the mouse | Drag the panel (fullscreen mode only) |
 | Back to the default position | `/quota reset` |
 | Log in again | `/quota login [claude\|codex]`, or click a `로그인 필요` row (fullscreen mode) |
+| Why usage jumped | `/quota why [claude\|codex] [30m\|1h\|3h\|5h\|24h]`, or click a `원인:` row (fullscreen mode) |
 
 The position is saved in `~/.pi/agent/quota-panel.json` and kept as an offset from the top-right corner, so the panel stays right-aligned when the terminal is resized. Mouse input reaches overlays only in pi's fullscreen TUI mode (the default); in regular mode the terminal owns the mouse, so use `/quota move` there.
 
@@ -57,6 +59,24 @@ History lives in a small SQLite database, `~/.pi/agent/quota-panel.db`, through 
 - `lease`: several pi sessions on one machine share the database, and only one of them calls the usage API or reads the session logs at a time. The others reuse the shared result, so opening many panes does not multiply API calls.
 
 Records older than 60 days are removed. If `node:sqlite` is unavailable the panel still works, without the burn rate. The database only covers this machine; usage from other machines or from Claude Code / Codex CLI counts against the same limits but is not in the logs.
+
+## Finding the cause of a spike
+
+When the 5-hour usage rises by 5 points or more within 15 minutes, or either window would run out before it resets, the panel analyzes the last hour of this machine's pi sessions and adds a `원인:` line with the main pattern. If the current session accounts for at least 20% of that hour's cost, it also shows a warning with the action to take (at most once every 30 minutes per account).
+
+`/quota why` opens the full analysis: the usage rise, the main cause and the action, other causes, the top sessions (the current one is marked), the cost split, context size, models and tools. `tab` switches accounts, `←`/`→` change the range, `esc` closes it.
+
+| Pattern | Signal | Action |
+|---|---|---|
+| 큰 컨텍스트 반복 | Average context of 120k tokens or more | `/compact`, or write a handoff and start a new session |
+| 짧은 턴 폭주 | One session with 30+ turns in 10 minutes, median output of 250 tokens or less, one tool for 85%+ of calls | Stop the polling or retry loop; wait in one script instead |
+| 동시 실행 | Three or more sessions active in the same 10 minutes | Run fewer sessions and subagents at once |
+| 캐시 미스 | Cache writes are 25%+ of the cost | Batch model and setting changes; compact long-idle sessions before resuming |
+| 출력 과다 | Output is 40%+ of the cost | Lower the thinking level and shorten outputs |
+| 외부 사용 | Usage rose 3+ points but this machine logged fewer than 3 turns | Check other machines and Claude Code / Codex CLI |
+| 비싼 모델 | An Opus model is 80%+ of the cost (shown with another cause) | Use Sonnet or Haiku for routine work |
+
+Cost comes from pi's session logs and only approximates how providers count usage against the limits. For models without prices, tokens weighted by relative price (output ×5, cache read ×0.1, cache write ×1.25) are used instead.
 
 ## Data sources
 

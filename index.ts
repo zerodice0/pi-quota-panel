@@ -1,11 +1,13 @@
 /**
  * 우측 상단 사용 한도(quota) 패널: Anthropic / OpenAI Codex의 5h·7d 사용률과 리셋까지 남은 시간.
- * 토글: ctrl+shift+u, alt+u 또는 /quota (on|off|refresh)
+ * 토글: ctrl+shift+u, alt+u 또는 /quota (on|off|refresh|reset)
+ * fullscreen 모드에서는 패널을 마우스로 끌어 옮길 수 있고, 위치는 ~/.pi/agent/quota-panel.json에 저장됨
  */
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { OverlayHandle, OverlayOptions, TuiMouseEvent } from "@earendil-works/pi-tui";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 // ── titanium 팔레트 ──────────────────────────────────────────
@@ -33,6 +35,10 @@ const BG_OFF = "\x1b[49m";
 const WIDTH = 42;
 const BAR = 12;
 const REFRESH_MS = 3 * 60_000;
+// pi-tui는 offset을 더한 뒤 margin 안으로 위치를 제한하므로 margin은 최소로 두고 위치는 offset으로 표현
+const MARGIN_TOP = 1;
+const MARGIN_RIGHT = 1;
+const positionFile = join(homedir(), ".pi/agent/quota-panel.json");
 
 type Win = { pct: number; resetAt: number } | null;
 type Row = { name: string; h5: Win; d7: Win; error?: string };
@@ -132,10 +138,24 @@ function ago(ts: number): string {
 	return `${Math.floor(s / 60)}분 전`;
 }
 
+type Position = { offsetX: number; offsetY: number };
+
+function readPosition(): Position {
+	try {
+		const p = JSON.parse(readFileSync(positionFile, "utf8"));
+		const x = Number(p.offsetX);
+		const y = Number(p.offsetY);
+		return { offsetX: Number.isFinite(x) ? Math.min(0, x) : 0, offsetY: Number.isFinite(y) ? Math.max(0, y) : 0 };
+	} catch {
+		return { offsetX: 0, offsetY: 0 };
+	}
+}
+
 class QuotaPanel {
 	rows: Row[] = [];
 	loading = true;
 	updatedAt = 0;
+	dragging = false;
 
 	invalidate() {}
 
@@ -147,7 +167,7 @@ class QuotaPanel {
 		};
 
 		const status = this.loading ? fg(C.dim, " 갱신 중… ") : this.updatedAt ? fg(C.dim, ` ${ago(this.updatedAt)} 갱신 `) : "";
-		const title = ` ${bold(fg(C.title, "사용 한도"))} `;
+		const title = ` ${bold(fg(this.dragging ? C.ok : C.title, "사용 한도"))} `;
 		const topFill = WIDTH - 2 - visibleWidth(title) - visibleWidth(status) - 2;
 		const out = [
 			`${BG}${fg(C.border, "╭─")}${title}${fg(C.border, "─".repeat(Math.max(1, topFill)))}${status}${fg(C.border, "─╮")}${BG_OFF}`,
@@ -185,7 +205,22 @@ class QuotaPanel {
 // ── 확장 ────────────────────────────────────────────────────
 export default function (pi: ExtensionAPI) {
 	const panel = new QuotaPanel();
-	let handle: { setHidden(h: boolean): void; isHidden(): boolean } | undefined;
+	// showOverlay는 이 객체를 참조로 보관하고 매 프레임 다시 읽으므로, offset을 바꾸면 바로 위치가 바뀜
+	const options: OverlayOptions = {
+		anchor: "top-right",
+		width: WIDTH,
+		margin: { top: MARGIN_TOP, right: MARGIN_RIGHT },
+		nonCapturing: true,
+		visible: (w) => w >= WIDTH + 40,
+		...readPosition(),
+	};
+	const savePosition = () => {
+		try {
+			writeFileSync(positionFile, `${JSON.stringify({ offsetX: options.offsetX ?? 0, offsetY: options.offsetY ?? 0 })}\n`);
+		} catch {}
+	};
+	let drag: { x: number; y: number; ox: number; oy: number } | undefined;
+	let handle: OverlayHandle | undefined;
 	let close: (() => void) | undefined;
 	let rerender: (() => void) | undefined;
 	let timer: ReturnType<typeof setInterval> | undefined;
@@ -217,17 +252,39 @@ export default function (pi: ExtensionAPI) {
 				(tui, _theme, _kb, done) => {
 					rerender = () => tui.requestRender();
 					close = () => done();
-					return panel;
+					return {
+						render: (width: number) => panel.render(width),
+						invalidate: () => panel.invalidate(),
+						// fullscreen 모드에서만 마우스 이벤트가 overlay로 전달됨. 패널 어디를 잡아도 끌어 옮길 수 있음
+						handleMouse(event: TuiMouseEvent) {
+							if (event.type === "press" && event.button === "left") {
+								drag = { x: event.screenX, y: event.screenY, ox: options.offsetX ?? 0, oy: options.offsetY ?? 0 };
+								panel.dragging = true;
+								return { capture: true, render: true };
+							}
+							if (!drag) return undefined;
+							if (event.type === "drag" || event.type === "move") {
+								// 화면 밖으로 쌓인 offset이 없도록 직접 범위를 제한(되돌아올 때 헛도는 구간 방지)
+								const maxLeft = Math.max(0, tui.terminal.columns - MARGIN_RIGHT - WIDTH);
+								const height = handle?.getBounds()?.height ?? 0;
+								const maxDown = Math.max(0, tui.terminal.rows - MARGIN_TOP - height);
+								options.offsetX = Math.min(0, Math.max(-maxLeft, drag.ox + event.screenX - drag.x));
+								options.offsetY = Math.min(maxDown, Math.max(0, drag.oy + event.screenY - drag.y));
+								return { handled: true, capture: true, render: true };
+							}
+							if (event.type === "release" || event.type === "click") {
+								if (event.type === "release") savePosition();
+								drag = undefined;
+								panel.dragging = false;
+								return { handled: true, render: true };
+							}
+							return { handled: true, capture: true };
+						},
+					};
 				},
 				{
 					overlay: true,
-					overlayOptions: {
-						anchor: "top-right",
-						width: WIDTH,
-						margin: { top: 1, right: 1 },
-						nonCapturing: true,
-						visible: (w) => w >= WIDTH + 40,
-					},
+					overlayOptions: options,
 					onHandle: (h) => {
 						handle = h;
 					},
@@ -236,6 +293,8 @@ export default function (pi: ExtensionAPI) {
 				handle = undefined;
 				close = undefined;
 				rerender = undefined;
+				drag = undefined;
+				panel.dragging = false;
 			});
 		}
 		stopTimers();
@@ -265,12 +324,20 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	pi.registerCommand("quota", {
-		description: "사용 한도 패널 (on|off|refresh, 단축키 ctrl+shift+u / alt+u)",
+		description: "사용 한도 패널 (on|off|refresh|reset, 단축키 ctrl+shift+u / alt+u, fullscreen에서 마우스로 이동)",
 		handler: async (args, ctx) => {
 			if (!ctx.hasUI) return;
 			const a = String(args ?? "").trim();
 			if (a === "on") show(ctx);
 			else if (a === "off") hide();
+			else if (a === "reset") {
+				// 기본 위치(오른쪽 위)로 되돌림
+				options.offsetX = 0;
+				options.offsetY = 0;
+				savePosition();
+				if (!visible) show(ctx);
+				else rerender?.();
+			}
 			else if (a === "refresh") {
 				if (!visible) show(ctx);
 				else await refresh(ctx);

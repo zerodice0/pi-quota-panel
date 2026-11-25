@@ -1,6 +1,6 @@
 /**
  * 우측 상단 사용 한도(quota) 패널: Anthropic / OpenAI Codex의 5h·7d 사용률과 리셋까지 남은 시간.
- * 토글: ctrl+shift+u, alt+u 또는 /quota (on|off|refresh|reset|move|login)
+ * 토글: ctrl+shift+r, alt+u 또는 /quota (on|off|refresh|reset|move|login)
  * 위치는 /quota move(키보드)나 fullscreen 모드의 마우스 드래그로 옮기고, ~/.pi/agent/quota-panel.json에 저장됨
  */
 import { readFileSync, statSync, writeFileSync } from "node:fs";
@@ -908,8 +908,10 @@ export default function (pi: ExtensionAPI) {
 		savePosition();
 	};
 
-	// ctrl+shift+u는 Linux 입력기(fcitx5/IBus)의 유니코드 입력 단축키와 겹칠 수 있어 alt+u도 함께 등록
-	for (const key of ["ctrl+shift+u", "alt+u"] as const) {
+	// ctrl+shift+u는 Linux 입력기(fcitx5/IBus)와 GTK 기본 입력기가 유니코드 16진 입력으로 가져가므로 쓰지 않음.
+	// ctrl+shift+r은 Ghostty·Herdr·pi 기본 키와 겹치지 않고, kitty 키보드 프로토콜이 없는 터미널에서
+	// ctrl+r로 들어와도 입력창에서는 아무 동작이 없음. alt+u는 어느 터미널에서나 동작함
+	for (const key of ["ctrl+shift+r", "alt+u"] as const) {
 		pi.registerShortcut(key, {
 			description: "사용 한도 패널 토글",
 			handler: async (ctx) => {
@@ -919,7 +921,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	pi.registerCommand("quota", {
-		description: "사용 한도 패널 (on|off|refresh|move|reset|login|why, 단축키 ctrl+shift+u / alt+u)",
+		description: "사용 한도 패널 (on|off|refresh|move|reset|login|why, 단축키 ctrl+shift+r / alt+u)",
 		// 입력이 이미 완성된 값이면 목록을 닫아 둠. 목록이 열려 있으면 Enter가 제출 대신 완성에 쓰임
 		getArgumentCompletions: (prefix) => {
 			const [verb, ...rest] = prefix.trimStart().split(/\s+/);

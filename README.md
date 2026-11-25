@@ -40,7 +40,7 @@ The status line shows each account's 5-hour usage (7-day when there is no 5-hour
 
 | Action | How |
 |---|---|
-| Toggle the panel | `ctrl+shift+u`, `alt+u` or `/quota` |
+| Toggle the panel | `ctrl+shift+r`, `alt+u` or `/quota` |
 | Show / hide | `/quota on`, `/quota off` |
 | Refresh now | `/quota refresh` (refreshes every 3 minutes otherwise, also while hidden) |
 | Move with the keyboard | `/quota move`, then arrow keys or `hjkl` (`shift` for bigger steps), `r` for the default position, `enter` to save, `esc` to cancel |

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.1
+
+- The panel shortcut is now `ctrl+shift+r` (`alt+u` still works). On Linux, `ctrl+shift+u` is taken by fcitx5/IBus and, when the input method passes it on, by GTK's built-in hex Unicode entry, which hides its input so the terminal looks frozen until Space or Enter commits a stray character.
+
 ## 0.5.0
 
 - Collection no longer depends on the panel: every interactive (TUI) pi session starts the collector at session start, so history, diagnosis and spike warnings keep working while the panel is hidden. The panel still starts hidden, and `/quota off` only hides it.

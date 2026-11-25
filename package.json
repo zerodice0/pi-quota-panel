@@ -1,0 +1,49 @@
+{
+  "name": "pi-quota-panel",
+  "version": "0.1.0",
+  "description": "Top-right pi overlay showing Claude and OpenAI Codex 5h/7d usage limits and time to reset.",
+  "type": "module",
+  "license": "MIT",
+  "author": "zerodice0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zerodice0/pi-quota-panel.git"
+  },
+  "homepage": "https://github.com/zerodice0/pi-quota-panel",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "quota",
+    "usage",
+    "overlay"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "files": [
+    "*.ts",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "scripts": {
+    "check": "node scripts/check.mjs"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    },
+    "@earendil-works/pi-tui": {
+      "optional": true
+    }
+  }
+}

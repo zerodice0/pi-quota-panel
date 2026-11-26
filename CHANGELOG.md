@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.0
+
+- `/quota mark [claude|codex] [30m|1h|2h|3h] [memo]` records the moment of a fix and measures its effect: the period after it is compared with the latest spike (or the hour before), led by the cost per hour of the session that caused it. The verdict (개선, 변화 작음, 악화, 급증 재발, 판단 불가) is notified once when the window ends and stays in the panel and the usage line for three hours.
+- `/quota check [claude|codex]` shows the before/after comparison at any time; in fullscreen mode, clicking the `조치 효과` row opens it.
+- `quota_effect` tool (`mark` / `check`) so agents can start a measurement and read the result without waiting or polling.
+- The cause line only shows while usage is actually spiking. Afterwards it becomes a dim `급증 멈춤 HH:MM · <cause>` for three hours, and a window that would run out before reset only colors the usage red instead of attaching a cause.
+- Accounts without a 5-hour window are checked for spikes on the 7-day window (2+ points within an hour).
+- Burn rates react faster: the last 30 minutes for 5h (was 1 hour) and the last 6 hours for 7d (was 24 hours).
+
 ## 0.6.0
 
 - The usage summary moved from the footer status to a line right under the editor. Below 100 columns it shows only the usage per account, colored red when a window would run out before it resets or usage is spiking, instead of the long warning (which also squeezed the footer on phones).

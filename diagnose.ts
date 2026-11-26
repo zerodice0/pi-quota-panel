@@ -33,8 +33,10 @@ export type Report = {
 	name: string;
 	from: number;
 	to: number;
-	/** 구간 동안 늘어난 5h 사용률(%p). 표본이 없으면 undefined */
+	/** 구간 동안 늘어난 사용률(%p, window 기준). 표본이 없으면 undefined */
 	delta?: number;
+	/** delta를 잰 사용률 구간 */
+	window: string;
 	/** false면 cost가 달러가 아니라 가중 토큰 수 */
 	priced: boolean;
 	/** 10분 단위로 본 최대 동시 세션 수 */
@@ -111,6 +113,9 @@ function sessionLabel(t: TurnRow): string {
 	return `${project}${started}${t.agent === "subagent" ? " · 서브" : ""}`;
 }
 
+/** 턴의 80% 이상에 가격 정보가 있으면 달러 비용을 씀. 아니면 가중 토큰 수 */
+export const isPriced = (turns: TurnRow[]) => turns.length > 0 && turns.filter((t) => t.cost > 0).length >= turns.length * 0.8;
+
 export function analyze(input: {
 	provider: string;
 	name: string;
@@ -119,8 +124,12 @@ export function analyze(input: {
 	turns: TurnRow[];
 	samples: Sample[];
 	currentSession?: string;
+	/** samples의 사용률 구간(기본 5h) */
+	window?: string;
+	/** 두 구간을 비교할 때 같은 단위(달러 또는 가중 토큰)로 맞추려고 지정함 */
+	priced?: boolean;
 }): Report {
-	const priced = input.turns.length > 0 && input.turns.filter((t) => t.cost > 0).length >= input.turns.length * 0.8;
+	const priced = input.priced ?? isPriced(input.turns);
 	const turns = priced
 		? input.turns
 		: input.turns.map((t) => {
@@ -266,6 +275,7 @@ export function analyze(input: {
 		from: input.from,
 		to: input.to,
 		delta,
+		window: input.window ?? "5h",
 		priced,
 		peakConcurrency,
 		turns: conv.length,

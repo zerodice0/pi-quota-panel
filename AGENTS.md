@@ -6,6 +6,7 @@ pi extension that draws a non-capturing overlay with Claude / Codex 5h·7d usage
 
 - `index.ts`: data fetch (`fetchAnthropic`, `fetchCodex`), burn rate (`trendOf`), rendering (`QuotaPanel`), overlay + mouse drag, `/quota` command and shortcuts.
 - `diagnose.ts`: pure analysis of a time range (`analyze`): cost split, sessions, concurrency and the cause patterns with their actions. Thresholds are constants at the top; tune them against real session data, not intuition (agentic work normally reaches 4–5 turns per minute).
+- `effect.ts`: pure before/after comparison for `/quota mark` / `/quota check` / the `quota_effect` tool (`measure`, `judge`) and the spike thresholds (`SURGE`) shared with the panel.
 - `db.ts`: SQLite store `~/.pi/agent/quota-panel.db` (`quota_samples`, `turns`, `file_offsets`, `lease`, `meta`) and incremental ingest of pi session JSONL.
 
 ## Rules
@@ -17,6 +18,9 @@ pi extension that draws a non-capturing overlay with Claude / Codex 5h·7d usage
 - Use only the built-in `node:sqlite` through `process.getBuiltinModule`; keep the `emitWarning` filter in `loadSqlite`, because Node 22 prints an ExperimentalWarning to stderr that corrupts the TUI. Every store call goes through `withStore` so a locked or broken database never throws into pi. Bump `SCHEMA_VERSION` with a migration when the schema changes.
 - Collection is separate from the overlay: `startCollector` runs on `session_start` only when `ctx.mode === "tui"` (RPC/print runs such as subagent children must not collect), and `hide()` only hides the overlay. Every process runs the timers, so any periodic work needs both a lease and a freshness check in `meta` (`status.fetchedAt`, `ingested_at`) to happen once per machine.
 - The usage line is a `belowEditor` widget (`mountUsageLine`), not `ctx.ui.setStatus`: footer statuses get no width and no mouse events, while a widget's `render(width)` lets `statusLine` pick full / compact / tiny text (compact below 100 columns, red instead of the long warning) and its `handleMouse` toggles the panel. It is re-rendered from `apply()` and removed on `session_shutdown`.
+- Keep "now" and "what happened" apart: `row.cause` is set only while the spike condition (`SURGE`) holds; afterwards `meta.incident:<provider>` drives the dim `급증 멈춤` line. Never attach a cause from the burn-rate forecast (`isDanger`) alone, or the last pattern sticks for the whole trend span after a fix.
+- Effect measurements live in `meta.mark:<provider>`. Recompute both periods at check time with one `priced` decision (`isPriced` over both), and settle a finished mark once per machine (lease + `result` written back), notifying from the session that created it first.
+- Agent-facing tools must never make the agent wait or poll for quota results; the extension does the waiting and notifies.
 - Diagnose only when `meta.ingested_at` is recent; during the first backfill the turns table is partial and the shares (and warnings) come out wrong.
 - The store API is synchronous and runs on pi's main thread: keep ingest bounded (`INGEST_BUDGET`) and never store message content.
 - Do not use TypeScript parameter properties or enums; Node's type stripping (used to run `db.ts` in quick tests) rejects them.

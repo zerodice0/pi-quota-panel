@@ -9,8 +9,20 @@ import { join, relative } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { KeyId, OverlayHandle, OverlayOptions, TUI, TuiMouseEvent } from "@earendil-works/pi-tui";
 import { Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { Type } from "typebox";
 import { openStore, type Sample, sessionsDir, type Store, type WindowKey } from "./db.ts";
-import { analyze, kTokens, percent, type Report, riseOf } from "./diagnose.ts";
+import { analyze, isPriced, kTokens, percent, type Report, riseOf } from "./diagnose.ts";
+import {
+	judge,
+	type Mark,
+	type Metrics,
+	measure,
+	signedPct,
+	SURGE,
+	type Verdict,
+	VERDICT_LABEL,
+	type VerdictKind,
+} from "./effect.ts";
 
 // ── titanium 팔레트 ──────────────────────────────────────────
 const rgb = (hex: string) => {
@@ -56,8 +68,21 @@ const PROVIDERS: { id: ProviderId; name: string; aliases: string[] }[] = [
 type Trend = { rate: number; unit: "h" | "d"; eta?: number };
 type Win = { pct: number; resetAt: number; trend?: Trend } | null;
 type Status = { fetchedAt: number; rows: Row[] };
-/** cause는 사용량이 급증하거나 리셋 전에 소진될 때만 채움(패널의 '원인:' 줄) */
-type Row = { id: ProviderId; name: string; h5: Win; d7: Win; error?: string; needsLogin?: boolean; cause?: string };
+/**
+ * cause는 지금 급증이 이어지는 동안만 채움(패널의 '원인:' 줄). 급증이 멈추면 resolved로 내려가 흐린 색으로 표시됨.
+ * effect는 /quota mark로 시작한 조치 효과 측정의 진행 상황이나 결과
+ */
+type Row = {
+	id: ProviderId;
+	name: string;
+	h5: Win;
+	d7: Win;
+	error?: string;
+	needsLogin?: boolean;
+	cause?: string;
+	resolved?: { at: number; label: string };
+	effect?: { text: string; short: string; color: string };
+};
 
 /** 다시 로그인해야 풀리는 오류(토큰 없음·만료, HTTP 401/403) */
 class LoginError extends Error {}
@@ -170,10 +195,11 @@ function ago(ts: number): string {
 }
 
 // ── 소모 속도 ──────────────────────────────────────────────
-// 5h는 최근 1시간, 7d는 최근 24시간의 표본으로 속도를 구함. 표본 간격이 너무 짧으면 흔들리므로 최소 구간을 둠
+// 5h는 최근 30분, 7d는 최근 6시간의 표본으로 속도를 구함. 표본 간격이 너무 짧으면 흔들리므로 최소 구간을 둠.
+// 5h를 1시간, 7d를 24시간으로 보면 조치로 속도가 떨어져도 그동안 급증 구간이 속도에 남아 '소진 예상'이 계속 빨갛게 보임
 const TREND = {
-	"5h": { span: 3600_000, minSpan: 10 * 60_000, unit: "h", unitMs: 3600_000 },
-	"7d": { span: 24 * 3600_000, minSpan: 2 * 3600_000, unit: "d", unitMs: 24 * 3600_000 },
+	"5h": { span: 30 * 60_000, minSpan: 10 * 60_000, unit: "h", unitMs: 3600_000 },
+	"7d": { span: 6 * 3600_000, minSpan: 2 * 3600_000, unit: "d", unitMs: 24 * 3600_000 },
 } as const;
 
 function trendOf(samples: Sample[], win: NonNullable<Win>, key: WindowKey): Trend | undefined {
@@ -234,7 +260,7 @@ const col = (label: string) => fg(C.label, label + " ".repeat(Math.max(1, 11 - v
 function whyLines(r: Report | undefined, rangeLabel: string): string[] {
 	if (!r) return [fg(C.crit, "이력 DB를 읽을 수 없습니다")];
 	const out = [`${bold(fg(C.title, "사용량 원인 분석"))} · ${r.name} · ${rangeLabel} (${hm(r.from, r.to)}–${hm(r.to)})`];
-	const delta = r.delta === undefined ? "5h 표본 없음" : `5h +${Math.round(r.delta)}%p`;
+	const delta = r.delta === undefined ? `${r.window} 표본 없음` : `${r.window} +${Math.round(r.delta)}%p`;
 	// 가격 정보가 없는 모델은 달러 대신 가중 토큰으로 표시
 	const amount = (v: number) => (r.priced ? `$${v.toFixed(2)}` : `${kTokens(v)} 가중 토큰`);
 	out.push(
@@ -270,6 +296,53 @@ function whyLines(r: Report | undefined, rangeLabel: string): string[] {
 	return out;
 }
 
+// ── 조치 효과 화면 ──────────────────────────────────────────
+const MARK_RANGES = [
+	{ ms: 30 * 60_000, arg: "30m" },
+	{ ms: 3600_000, arg: "1h" },
+	{ ms: 2 * 3600_000, arg: "2h" },
+	{ ms: 3 * 3600_000, arg: "3h" },
+];
+
+const verdictColor = (k: VerdictKind) =>
+	k === "improved" ? C.ok : k === "worse" || k === "recurred" ? C.crit : k === "same" ? C.warn : C.dim;
+
+type Evaluation = { before: Metrics; after: Metrics; verdict: Verdict };
+
+function effectViewLines(m: Mark, ev: Evaluation | undefined, now: number): string[] {
+	const out = [`${bold(fg(C.title, "조치 효과"))} · ${m.name}${m.memo ? ` · ${m.memo}` : ""}`];
+	if (!ev) {
+		out.push(fg(C.crit, "이력 DB를 읽을 수 없습니다"));
+		return out;
+	}
+	const { before: b, after: a, verdict: v } = ev;
+	const total = Math.round((m.until - m.at) / 60_000);
+	const done = Math.round((Math.min(now, m.until) - m.at) / 60_000);
+	out.push(`${col("판정")}${bold(fg(verdictColor(v.kind), VERDICT_LABEL[v.kind]))}: ${v.summary}`);
+	out.push(
+		`${col("조치 후")}${hm(m.at, now)}–${hm(m.until, now)} 관찰 ${done}/${total}분${now < m.until ? ` (${left(m.until - now)} 남음)` : ""}`,
+	);
+	out.push(`${col("조치 전")}${hm(b.from, now)}–${hm(b.to, now)} ${fg(C.dim, m.fromIncident ? "최근 급증 구간" : "조치 직전 1시간")}`);
+	if (m.focus) out.push(`${col("문제 세션")}${m.focus.label} ${fg(C.dim, "(조치 전 비용이 가장 큰 세션)")}`);
+	const amount = (x: number) => (a.priced ? `$${x.toFixed(2)}` : kTokens(x));
+	const rate = (x?: number) => (x === undefined ? "–" : `+${x >= 10 ? Math.round(x) : x.toFixed(1)}%p/h`);
+	const row = (label: string, x: string, y: string) => `${col(label)}${x}${" ".repeat(Math.max(1, 14 - visibleWidth(x)))}→ ${y}`;
+	out.push(`${col("")}${fg(C.dim, `조치 전${" ".repeat(10)}→ 조치 후`)}`);
+	out.push(row(`${m.window} 사용률`, rate(b.risePerH), rate(a.risePerH)));
+	const unit = a.priced ? "/h" : " 가중/h";
+	out.push(row("비용", `${amount(b.costPerH)}${unit}`, `${amount(a.costPerH)}${unit}`));
+	if (m.focus) out.push(row("문제 세션", `${amount(b.focusCostPerH)}${unit}`, `${amount(a.focusCostPerH)}${unit} · ${a.focusTurns}턴`));
+	out.push(row("분당 턴", b.turnsPerMin.toFixed(1), a.turnsPerMin.toFixed(1)));
+	out.push(row("컨텍스트", `평균 ${kTokens(b.avgCtx)}`, `평균 ${kTokens(a.avgCtx)}`));
+	out.push(row("최대 동시", `${b.peakConcurrency}개`, `${a.peakConcurrency}개`));
+	const causes = (x: Metrics) => x.causes.map((c) => c.label).join(", ") || "없음";
+	out.push(row("원인", causes(b), causes(a)));
+	v.notes.forEach((n, i) => out.push(`${col(i === 0 ? "참고" : "")}${fg(C.label, n)}`));
+	return out;
+}
+
+const stripAnsi = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
+
 /** 지금 속도로는 리셋 전에 100%에 닿음 */
 const isDanger = (w: Win) => !!w?.trend?.eta && w.trend.rate > 0 && w.trend.eta < w.resetAt;
 
@@ -297,6 +370,8 @@ function statusText(rows: Row[], detail: Detail): string {
 			text += ` ${fg(t.danger ? C.crit : C.dim, t.danger ? `${rate} ${clock(w.trend!.eta!)} 소진` : rate)}`;
 		}
 		if (r.cause) text += ` ${fg(C.warn, r.cause)}`;
+		else if (r.resolved) text += ` ${fg(C.dim, `급증 멈춤 ${hm(r.resolved.at)}`)}`;
+		if (r.effect) text += ` ${fg(r.effect.color, r.effect.short)}`;
 		return text;
 	});
 	return parts.join(fg(C.dim, " · "));
@@ -336,6 +411,8 @@ class QuotaPanel {
 	loginLines = new Map<number, Row | null>();
 	/** 클릭하면 원인 분석을 여는 줄 → 대상 계정 */
 	whyLines = new Map<number, Row>();
+	/** 클릭하면 조치 효과 화면을 여는 줄 → 대상 계정 */
+	effectLines = new Map<number, Row>();
 
 	invalidate() {}
 
@@ -355,6 +432,7 @@ class QuotaPanel {
 
 		this.loginLines.clear();
 		this.whyLines.clear();
+		this.effectLines.clear();
 		out.push(line("")); // 위쪽 여백
 		if (!this.rows.length) {
 			out.push(line(fg(C.dim, this.loading ? "불러오는 중…" : "로그인된 계정이 없습니다")));
@@ -389,6 +467,14 @@ class QuotaPanel {
 			if (r.cause) {
 				this.whyLines.set(out.length, r);
 				out.push(line(`${" ".repeat(7)}${fg(C.warn, `원인: ${r.cause}`)}`));
+			} else if (r.resolved) {
+				// 급증이 멈춘 뒤에도 무엇이 있었는지는 남기되, 지금 상태와 헷갈리지 않게 흐린 색으로
+				this.whyLines.set(out.length, r);
+				out.push(line(`${" ".repeat(7)}${fg(C.dim, `급증 멈춤 ${hm(r.resolved.at)} · ${r.resolved.label}`)}`));
+			}
+			if (r.effect) {
+				this.effectLines.set(out.length, r);
+				out.push(line(`${" ".repeat(7)}${fg(r.effect.color, r.effect.text)}`));
 			}
 		});
 
@@ -407,6 +493,8 @@ const VERBS = [
 	{ value: "reset", description: "기본 위치(오른쪽 위)로 되돌림" },
 	{ value: "login", description: "계정 로그인 (/login 명령을 입력창에 채움)" },
 	{ value: "why", description: "사용량 급증 원인 분석 (계정, 기간: 30m|1h|3h|5h|24h)" },
+	{ value: "mark", description: "조치한 시각을 기록하고 효과 측정 시작 (계정, 기간: 30m|1h|2h|3h, 메모)" },
+	{ value: "check", description: "조치 전후 비교와 판정 (계정)" },
 ];
 const STATUS_KEY = "quota-panel";
 const MOVE_ARGS = ["left", "right", "up", "down", "top-left", "top-right", "bottom-left", "bottom-right"];
@@ -479,47 +567,214 @@ export default function (pi: ExtensionAPI) {
 
 	// ── 원인 진단 ──
 	/** 이 pi 세션의 기록 파일(turns.session_file과 같은 형식). 상위 세션에서 '이 세션'을 표시하고 알림 대상을 고를 때 씀 */
-	const currentSession = () => {
+	const currentSession = (ctx = lastCtx) => {
 		try {
-			const file = lastCtx?.sessionManager.getSessionFile();
+			const file = ctx?.sessionManager.getSessionFile();
 			return file ? relative(sessionsDir, file) : undefined;
 		} catch {
 			return undefined;
 		}
 	};
 
+	/**
+	 * 사용률을 볼 구간. 최근 5시간에 5h 표본이 있으면 5h, 없으면(7d만 있는 요금제이거나 5h 구간이 시작되지 않음) 7d.
+	 * 5h만 보던 때는 7d만 있는 계정에서 급증을 잡지 못하고, 24시간 속도로 정한 '소진 예상'만 원인 표시를 띄웠음
+	 */
+	const windowOf = (id: ProviderId, at = Date.now()): WindowKey =>
+		withStore((s) => (s.samples(id, "5h", at - 5 * 3600_000).length ? "5h" : "7d")) ?? "5h";
+
 	const buildReport = (id: ProviderId, from: number, to: number): Report | undefined =>
-		withStore((s) =>
-			analyze({
+		withStore((s) => {
+			const window = windowOf(id, to);
+			return analyze({
 				provider: id,
 				name: PROVIDERS.find((p) => p.id === id)?.name ?? id,
 				from,
 				to,
 				turns: s.turnsBetween(from, to, id),
-				samples: s.samples(id, "5h", from).filter((x) => x.at <= to),
+				samples: s.samples(id, window, from).filter((x) => x.at <= to),
+				window,
 				currentSession: currentSession(),
-			}),
-		);
+			});
+		});
+
+	// ── 급증 구간과 조치 효과 ──
+	/** 마지막으로 급증이 보인 구간. 여러 pi 프로세스가 같이 쓰도록 meta에 둠 */
+	type Incident = { start: number; lastSeen: number; label: string };
+	/** 이만큼 쉬었다 다시 급증하면 새 급증으로 봄 */
+	const INCIDENT_GAP = 30 * 60_000;
+	/** 멈춘 급증과 끝난 측정 결과를 패널에 남겨 두는 시간 */
+	const RECENT = 3 * 3600_000;
+	const incidentOf = (id: ProviderId) => withStore((s) => s.getMeta<Incident>(`incident:${id}`) ?? undefined);
+	const markOf = (id: ProviderId) => withStore((s) => s.getMeta<Mark | null>(`mark:${id}`) ?? undefined);
+
+	/**
+	 * 조치 전후를 다시 계산함. 두 구간을 같은 단위(달러 또는 가중 토큰)로 맞추려고
+	 * 가격 정보 여부는 두 구간을 합친 턴으로 정함
+	 */
+	const evaluate = (m: Mark, now: number): Evaluation | undefined =>
+		withStore((s) => {
+			const id = m.provider;
+			const to = Math.max(m.at, Math.min(now, m.until));
+			const priced = isPriced(s.turnsBetween(m.baseline.from, to, id));
+			const metrics = (from: number, upto: number) =>
+				measure({
+					provider: id,
+					name: m.name,
+					from,
+					to: upto,
+					turns: s.turnsBetween(from, upto, id),
+					samples: s.samples(id, m.window, from),
+					priced,
+					focusKey: m.focus?.key,
+					window: m.window,
+				});
+			const before = metrics(m.baseline.from, m.baseline.to);
+			const after = metrics(m.at, to);
+			return { before, after, verdict: judge({ at: m.at, focus: m.focus, baseline: before, window: m.window }, after, now) };
+		});
+
+	/**
+	 * 조치한 시각을 기록하고 측정을 시작함. 조치 전 구간은 3시간 안에 급증이 있었으면 그 급증 구간(앞 15분 포함, 최소 30분),
+	 * 없으면 조치 직전 1시간. 문제 세션은 조치 전 구간에서 비용이 가장 큰 세션
+	 */
+	const startMark = (ctx: ExtensionContext, id: ProviderId, ms: number, memo?: string): Mark | undefined => {
+		ingest(true);
+		const now = Date.now();
+		const inc = incidentOf(id);
+		const window = windowOf(id, now);
+		let from = now - 3600_000;
+		let to = now;
+		const fromIncident = !!inc && now - inc.lastSeen < RECENT;
+		if (fromIncident) {
+			to = Math.min(now, inc.lastSeen);
+			from = Math.max(to - RECENT, Math.min(inc.start - SURGE[window].span, to - 30 * 60_000));
+		}
+		const name = PROVIDERS.find((p) => p.id === id)?.name ?? id;
+		const top = buildReport(id, from, to)?.sessions[0];
+		const draft: Mark = {
+			provider: id,
+			name,
+			at: now,
+			until: now + ms,
+			memo: memo || undefined,
+			createdIn: currentSession(ctx),
+			window,
+			fromIncident,
+			focus: top && top.cost > 0 ? { key: top.key, label: top.label } : undefined,
+			// 조치 전 값은 판정할 때 다시 계산하므로 여기서는 구간이 중요함
+			baseline: { from, to } as Metrics,
+		};
+		const ev = evaluate(draft, now);
+		if (!ev) return undefined;
+		const mark: Mark = { ...draft, baseline: ev.before };
+		const ok = withStore((s) => {
+			s.setMeta(`mark:${id}`, mark);
+			return true;
+		});
+		if (!ok) return undefined;
+		if (lastStatus) apply(lastStatus);
+		return mark;
+	};
+
+	/**
+	 * 측정이 끝난 표시를 한 번만 판정하고 알림. 표시를 만든 세션이 먼저 맡고, 그 세션이 3분 안에 처리하지 않으면(종료됨 등)
+	 * 다른 TUI 세션이 맡음. 수집이 끝 시각까지 따라오지 않았으면 기다림
+	 */
+	const settleMarks = (now: number) => {
+		const ingestedAt = withStore((s) => s.getMeta<number>("ingested_at")) ?? 0;
+		for (const p of PROVIDERS) {
+			const m = markOf(p.id);
+			if (!m || m.result || now < m.until || ingestedAt < m.until) continue;
+			if (m.createdIn !== currentSession() && now < m.until + 3 * 60_000) continue;
+			const settled = withStore((s) => {
+				if (!s.tryLease(`mark:${p.id}`, 60_000)) return undefined;
+				try {
+					const fresh = s.getMeta<Mark | null>(`mark:${p.id}`);
+					if (!fresh || fresh.result || fresh.at !== m.at) return undefined;
+					const ev = evaluate(fresh, now);
+					if (!ev) return undefined;
+					const done: Mark = { ...fresh, baseline: ev.before, result: { after: ev.after, verdict: ev.verdict, at: now } };
+					s.setMeta(`mark:${p.id}`, done);
+					return done;
+				} finally {
+					s.release(`mark:${p.id}`);
+				}
+			});
+			if (!settled?.result) continue;
+			if (lastStatus) apply(lastStatus);
+			if (!lastCtx?.hasUI) continue;
+			const v = settled.result.verdict;
+			lastCtx.ui.notify(
+				`${settled.name} 조치 효과${settled.memo ? `(${settled.memo})` : ""}: ${VERDICT_LABEL[v.kind]} — ${v.summary}. 자세한 내용은 /quota check`,
+				v.kind === "improved" ? "info" : "warning",
+			);
+		}
+	};
+
+	/** 패널과 사용량 줄에 보일 측정 상태. 끝난 결과는 RECENT 동안 남김 */
+	const effectOf = (id: ProviderId, now: number): Row["effect"] => {
+		const m = markOf(id);
+		if (!m) return undefined;
+		if (!m.result) {
+			if (now < m.until) return { text: `조치 효과 측정 중 · ${left(m.until - now)} 남음`, short: "측정 중", color: C.dim };
+			return now - m.until < RECENT ? { text: "조치 효과 계산 중", short: "측정 끝", color: C.dim } : undefined;
+		}
+		if (now - m.until >= RECENT) return undefined;
+		const v = m.result.verdict;
+		const pct = v.ratio !== undefined && v.kind !== "unknown" ? ` ${signedPct(v.ratio)}` : "";
+		const label = `${VERDICT_LABEL[v.kind]}${pct}`;
+		return { text: `조치 효과: ${label}`, short: `조치 ${label}`, color: verdictColor(v.kind) };
+	};
+
+	/** 계정을 고르지 않았을 때: 지금 급증 중인 계정, 최근 급증이 있었던 계정, 최근 1시간 비용이 가장 큰 계정 순 */
+	const likelyProvider = (): ProviderId => {
+		const now = Date.now();
+		const busy = panel.rows.find((r) => r.cause);
+		if (busy) return busy.id;
+		const recent = PROVIDERS.map((p) => ({ p: p.id, at: incidentOf(p.id)?.lastSeen ?? 0 }))
+			.filter((x) => now - x.at < RECENT)
+			.sort((a, b) => b.at - a.at)[0];
+		if (recent) return recent.p;
+		return PROVIDERS.map((p) => ({ p: p.id, cost: buildReport(p.id, now - 3600_000, now)?.cost ?? 0 })).sort(
+			(a, b) => b.cost - a.cost,
+		)[0].p;
+	};
 
 	// 같은 계정의 알림은 프로세스마다 30분에 한 번만
 	const alertedAt = new Map<ProviderId, number>();
 
 	/**
-	 * 급증(최근 15분에 5h 사용률 +5%p 이상)이거나 리셋 전에 소진될 속도면 최근 1시간을 진단해 패널에 원인을 표시함.
+	 * 급증(최근 15분에 5h 사용률 +5%p 이상, 5h가 없으면 최근 1시간에 7d 사용률 +2%p 이상)이 이어지는 동안만 최근 1시간을 진단해 패널에 원인을 표시하고,
+	 * 급증 구간(시작·마지막 시각과 원인)을 meta에 남김. 급증이 멈추면 원인 대신 '급증 멈춤'을 흐린 색으로 보여 줌.
+	 * 리셋 전에 소진될 속도는 사용률을 빨간색으로 칠하기만 하고 원인을 붙이지 않음(조치 뒤에도 지난 패턴이 계속 남아 보이던 문제).
 	 * 알림은 이 세션이 그 구간 비용의 20% 이상을 차지할 때만 띄움. 모든 pi가 동시에 알리지 않고, 원인을 만든 세션에서만 알림
 	 */
 	const diagnose = (row: Row, now: number) => {
 		if (row.error) return;
-		const recent = withStore((s) => s.samples(row.id, "5h", now - 15 * 60_000)) ?? [];
-		const surge = (riseOf(recent) ?? 0) >= 5;
-		if (!surge && !isDanger(row.h5) && !isDanger(row.d7)) return;
+		const window: WindowKey = row.h5 ? "5h" : "7d";
+		const { rise, span } = SURGE[window];
+		const recent = withStore((s) => s.samples(row.id, window, now - span)) ?? [];
+		const surge = (riseOf(recent) ?? 0) >= rise;
+		if (!surge) {
+			const inc = incidentOf(row.id);
+			if (inc && now - inc.lastSeen < RECENT) row.resolved = { at: inc.lastSeen, label: inc.label };
+			return;
+		}
 		// 처음 수집 중이거나 수집이 멈춘 상태에서 진단하면 일부 기록만 보고 원인을 잘못 짚으므로 건너뜀
 		const ingestedAt = withStore((s) => s.getMeta<number>("ingested_at")) ?? 0;
 		if (now - ingestedAt > 3 * 60_000) return;
 		const report = buildReport(row.id, now - 3600_000, now);
 		if (!report) return;
 		const cause = report.causes[0];
-		row.cause = cause?.label ?? "뚜렷한 원인 없음";
+		const label = cause?.label ?? "뚜렷한 원인 없음";
+		row.cause = label;
+		// 잠깐 멈춘 뒤 다시 오르면 같은 급증으로 보고 시작 시각을 유지함
+		withStore((s) => {
+			const prev = s.getMeta<Incident>(`incident:${row.id}`);
+			const start = prev && now - prev.lastSeen < INCIDENT_GAP ? prev.start : now;
+			s.setMeta(`incident:${row.id}`, { start, lastSeen: now, label } satisfies Incident);
+		});
 
 		const mine = report.sessions.find((s) => s.current);
 		if (!cause || !mine || !lastCtx?.hasUI || report.cost <= 0 || mine.cost / report.cost < 0.2) return;
@@ -538,7 +793,7 @@ export default function (pi: ExtensionAPI) {
 		lastStatus = status;
 		const now = Date.now();
 		panel.rows = status.rows.map((r) => {
-			const row: Row = { ...r, cause: undefined };
+			const row: Row = { ...r, cause: undefined, resolved: undefined, effect: undefined };
 			for (const key of ["5h", "7d"] as const) {
 				const prop = key === "5h" ? "h5" : "d7";
 				const w = row[prop];
@@ -547,6 +802,7 @@ export default function (pi: ExtensionAPI) {
 				row[prop] = { pct: w.pct, resetAt: w.resetAt, trend: trendOf(samples, w, key) };
 			}
 			diagnose(row, now);
+			if (!row.error) row.effect = effectOf(row.id, now);
 			return row;
 		});
 		panel.updatedAt = status.fetchedAt;
@@ -718,6 +974,7 @@ export default function (pi: ExtensionAPI) {
 		// 남은 시간 표시를 갱신하고, 다른 프로세스가 저장한 더 새 결과와 수집한 턴으로 다시 진단함
 		tick = setInterval(() => {
 			syncFromStore();
+			settleMarks(Date.now());
 			rerender?.();
 		}, 30_000);
 		authWatch = setInterval(() => watchAuth(ctx), 3_000);
@@ -782,6 +1039,9 @@ export default function (pi: ExtensionAPI) {
 								// '원인:' 줄을 누르면 그 계정의 원인 분석을 엶
 								const why = panel.whyLines.get(event.y);
 								if (why && lastCtx) void showWhy(lastCtx, why.id);
+								// '조치 효과' 줄을 누르면 조치 전후 비교를 염
+								const effect = panel.effectLines.get(event.y);
+								if (effect && lastCtx) void showEffect(lastCtx, effect.id);
 								return { handled: true };
 							}
 							if (event.type === "press" && event.button === "left") {
@@ -883,6 +1143,126 @@ export default function (pi: ExtensionAPI) {
 		}
 	};
 
+	// ── 조치 효과(/quota mark, /quota check) ──
+	/** 측정 중이거나 끝난 표시 가운데 가장 최근 것 */
+	const latestMark = (id?: ProviderId) =>
+		(id ? [markOf(id)] : PROVIDERS.map((p) => markOf(p.id)))
+			.filter((m): m is Mark => !!m)
+			.sort((a, b) => b.at - a.at)[0];
+
+	/** 끝난 측정은 저장한 결과를, 측정 중이면 지금까지의 중간 결과를 계산함 */
+	const evaluationOf = (m: Mark, now: number): Evaluation | undefined =>
+		m.result ? { before: m.baseline, after: m.result.after, verdict: m.result.verdict } : evaluate(m, now);
+
+	const effectReport = (id?: ProviderId): { mark?: Mark; lines: string[] } => {
+		ingest(true);
+		const mark = latestMark(id);
+		if (!mark) return { lines: ["측정한 조치가 없습니다. 조치한 직후 /quota mark 로 측정을 시작하세요"] };
+		const now = Date.now();
+		return { mark, lines: effectViewLines(mark, evaluationOf(mark, now), now) };
+	};
+
+	const markUsage = `/quota mark [claude|codex] [${MARK_RANGES.map((r) => r.arg).join("|")}] [메모]`;
+	/** 인자 순서는 상관없음. 계정·기간이 아닌 나머지는 메모 */
+	const parseMarkArgs = (words: string[]) => {
+		let provider: ProviderId | undefined;
+		let ms: number | undefined;
+		const memo: string[] = [];
+		for (const w of words) {
+			const lower = w.toLowerCase();
+			const p = PROVIDERS.find((x) => x.aliases.includes(lower));
+			const r = MARK_RANGES.find((x) => x.arg === lower);
+			if (p && !provider) provider = p.id;
+			else if (r && ms === undefined) ms = r.ms;
+			else memo.push(w);
+		}
+		return { provider, ms: ms ?? 3600_000, memo: memo.join(" ").slice(0, 80) };
+	};
+
+	const markMessage = (m: Mark) =>
+		`${m.name} 조치 효과 측정을 시작했습니다: ${hm(m.at)}–${hm(m.until)}. ` +
+		`조치 전 구간 ${hm(m.baseline.from)}–${hm(m.baseline.to)}(${m.fromIncident ? "최근 급증 구간" : "조치 직전 1시간"})` +
+		`${m.focus ? `, 문제 세션 ${m.focus.label}` : ""}. 끝나면 알리고, 중간 결과는 /quota check 로 봅니다`;
+
+	let effectOpen = false;
+	const showEffect = async (ctx: ExtensionContext, id?: ProviderId) => {
+		if (effectOpen) return;
+		if (!getStore()) {
+			ctx.ui.notify("이력 DB를 열 수 없어 조치 효과를 측정할 수 없습니다 (node:sqlite 필요)", "error");
+			return;
+		}
+		let report = effectReport(id);
+		if (!report.mark) {
+			ctx.ui.notify(report.lines[0], "info");
+			return;
+		}
+		const ids = PROVIDERS.map((p) => p.id).filter((p) => markOf(p));
+		let index = Math.max(0, ids.indexOf(report.mark.provider as ProviderId));
+		effectOpen = true;
+		try {
+			await ctx.ui.custom<void>((t, _theme, _kb, done) => ({
+				render: (width: number) =>
+					[...report.lines, fg(C.dim, `${ids.length > 1 ? "tab 계정 전환 · " : ""}r 다시 계산 · esc 닫기`)].map((l) =>
+						truncateToWidth(l, width),
+					),
+				invalidate() {},
+				handleInput(data: string) {
+					if (matchesKey(data, Key.tab) && ids.length > 1) index = (index + 1) % ids.length;
+					else if (data === "r") {
+						// 그대로 다시 계산
+					} else if (matchesKey(data, Key.escape) || matchesKey(data, Key.enter) || data === "q") {
+						done();
+						return;
+					} else return;
+					report = effectReport(ids[index]);
+					t.requestRender();
+				},
+			}));
+		} finally {
+			effectOpen = false;
+		}
+	};
+
+	// 에이전트가 "패치 뒤 1시간 측정해서 확인해줘" 같은 요청을 직접 처리하되, 기다리며 폴링하지 않게
+	// 측정은 확장이 맡고 에이전트는 시작과 결과 조회만 함
+	pi.registerTool({
+		name: "quota_effect",
+		label: "Quota effect",
+		description:
+			"Measure whether a fix for a Claude/Codex usage spike worked. action=mark records now as the moment of the fix and starts a measurement window " +
+			"(the extension compares the window with the spike or the hour before and notifies the user when it ends). action=check returns the " +
+			"verdict so far: before/after usage rate, cost per hour of the session that caused the spike, concurrency, context size and remaining causes.",
+		promptSnippet: "Start (mark) or read (check) a before/after measurement of Claude/Codex quota usage after a fix",
+		promptGuidelines: [
+			"Use quota_effect with action=mark right after applying a fix for a usage spike, then end your turn; do not wait, sleep or poll for the result, because the extension notifies the user when the window ends.",
+			"Use quota_effect with action=check when the user asks whether a quota or usage fix worked.",
+		],
+		parameters: Type.Object({
+			action: Type.Union([Type.Literal("mark"), Type.Literal("check")]),
+			provider: Type.Optional(
+				Type.Union([Type.Literal("claude"), Type.Literal("codex")], { description: "account; default: the one that spiked" }),
+			),
+			duration: Type.Optional(
+				Type.Union(
+					MARK_RANGES.map((r) => Type.Literal(r.arg)),
+					{ description: "measurement window for mark (default 1h)" },
+				),
+			),
+			memo: Type.Optional(Type.String({ description: "what was changed, shown with the result (mark only)" })),
+		}),
+		async execute(_id, p, _signal, _onUpdate, ctx) {
+			const text = (s: string) => ({ content: [{ type: "text" as const, text: s }], details: {} });
+			if (!getStore()) return text("Usage history database is unavailable (node:sqlite required).");
+			const provider = p.provider ? PROVIDERS.find((x) => x.aliases.includes(p.provider!))?.id : undefined;
+			if (p.action === "mark") {
+				const ms = MARK_RANGES.find((r) => r.arg === p.duration)?.ms ?? 3600_000;
+				const m = startMark(ctx, provider ?? likelyProvider(), ms, p.memo?.slice(0, 80));
+				return text(m ? markMessage(m) : "Could not write the usage history database.");
+			}
+			return text(effectReport(provider).lines.map(stripAnsi).join("\n"));
+		},
+	});
+
 	// ── 키보드 이동 모드 ──
 	// 일반 모드에서는 마우스가 터미널 몫이라 드래그가 안 되므로, 방향키로 옮기는 길을 따로 둠
 	const startMove = async (ctx: ExtensionContext) => {
@@ -971,7 +1351,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	pi.registerCommand("quota", {
-		description: "사용 한도 패널 (on|off|refresh|move|reset|login|why, 단축키 ctrl+shift+r / alt+u)",
+		description: "사용 한도 패널 (on|off|refresh|move|reset|login|why|mark|check, 단축키 ctrl+shift+r / alt+u)",
 		// 입력이 이미 완성된 값이면 목록을 닫아 둠. 목록이 열려 있으면 Enter가 제출 대신 완성에 쓰임
 		getArgumentCompletions: (prefix) => {
 			const [verb, ...rest] = prefix.trimStart().split(/\s+/);
@@ -986,6 +1366,14 @@ export default function (pi: ExtensionAPI) {
 				if (values.includes(last)) return null;
 				const before = [verb, ...rest.slice(0, -1)].join(" ");
 				return values.filter((v) => v.startsWith(last)).map((v) => ({ value: `${before} ${v}`, label: v }));
+			}
+			if ((verb === "mark" && rest.length <= 2) || (verb === "check" && rest.length === 1)) {
+				const last = rest[rest.length - 1];
+				const values = [...PROVIDERS.map((p) => p.aliases[0]), ...(verb === "mark" ? MARK_RANGES.map((r) => r.arg) : [])];
+				if (!rest.length || values.includes(last) || !last) return null;
+				const before = [verb, ...rest.slice(0, -1)].join(" ");
+				const hits = values.filter((v) => v.startsWith(last));
+				return hits.length ? hits.map((v) => ({ value: `${before} ${v}`, label: v })) : null;
 			}
 			if (rest.length || VERBS.some((v) => v.value === verb)) return null;
 			return VERBS.filter((v) => v.value.startsWith(verb)).map((v) => ({ ...v, label: v.value }));
@@ -1032,6 +1420,24 @@ export default function (pi: ExtensionAPI) {
 				}
 				lastCtx ??= ctx;
 				await showWhy(ctx, provider, rangeMs);
+			} else if (verb === "mark") {
+				if (!getStore()) {
+					ctx.ui.notify("이력 DB를 열 수 없어 조치 효과를 측정할 수 없습니다 (node:sqlite 필요)", "error");
+					return;
+				}
+				lastCtx ??= ctx;
+				const { provider, ms, memo } = parseMarkArgs(rest.filter(Boolean));
+				const m = startMark(ctx, provider ?? likelyProvider(), ms, memo);
+				ctx.ui.notify(m ? markMessage(m) : `측정을 시작하지 못했습니다. 사용법: ${markUsage}`, m ? "info" : "error");
+			} else if (verb === "check") {
+				const ref = rest[0]?.toLowerCase();
+				const provider = ref ? PROVIDERS.find((p) => p.aliases.includes(ref)) : undefined;
+				if (ref && !provider) {
+					ctx.ui.notify(`알 수 없는 계정: ${rest[0]} (claude, codex)`, "error");
+					return;
+				}
+				lastCtx ??= ctx;
+				await showEffect(ctx, provider?.id);
 			} else if (verb === "refresh") {
 				if (!visible) show(ctx);
 				else await refresh(ctx, true);

@@ -49,6 +49,8 @@ The usage line shows each account's 5-hour usage (7-day when there is no 5-hour 
 | Back to the default position | `/quota reset` |
 | Log in again | `/quota login [claude\|codex]`, or click a `로그인 필요` row (fullscreen mode) |
 | Why usage jumped | `/quota why [claude\|codex] [30m\|1h\|3h\|5h\|24h]`, or click a `원인:` row (fullscreen mode) |
+| Measure a fix | `/quota mark [claude\|codex] [30m\|1h\|2h\|3h] [memo]` right after the fix |
+| Did the fix work | `/quota check [claude\|codex]`, or click a `조치 효과` row (fullscreen mode) |
 
 The position is saved in `~/.pi/agent/quota-panel.json` and kept as an offset from the top-right corner, so the panel stays right-aligned when the terminal is resized. Mouse input reaches overlays only in pi's fullscreen TUI mode (the default); in regular mode the terminal owns the mouse, so use `/quota move` there.
 
@@ -58,7 +60,7 @@ The panel is hidden when the terminal is too narrow to fit it (44 columns).
 
 ## Burn rate and history
 
-Under each window the panel shows how fast it is being used: the last hour for the 5-hour window (`%/h`) and the last 24 hours for the 7-day window (`%/일`). If the window would run out before it resets at that pace, the line turns red and shows the projected time (`19:34 소진 예상`); otherwise it reads `리셋까지 여유`. The line appears once there are enough samples (10 minutes for 5h, 2 hours for 7d).
+Under each window the panel shows how fast it is being used: the last 30 minutes for the 5-hour window (`%/h`) and the last 6 hours for the 7-day window (`%/일`). The spans are short on purpose, so the rate drops soon after a fix instead of carrying the spike for an hour or a day. If the window would run out before it resets at that pace, the line turns red and shows the projected time (`19:34 소진 예상`); otherwise it reads `리셋까지 여유`. The line appears once there are enough samples (10 minutes for 5h, 2 hours for 7d).
 
 History lives in a small SQLite database, `~/.pi/agent/quota-panel.db`, through Node's built-in `node:sqlite` (no extra dependency):
 
@@ -70,7 +72,9 @@ Records older than 60 days are removed. If `node:sqlite` is unavailable the pane
 
 ## Finding the cause of a spike
 
-When the 5-hour usage rises by 5 points or more within 15 minutes, or either window would run out before it resets, the panel analyzes the last hour of this machine's pi sessions and adds a `원인:` line with the main pattern (also shown in the usage line while the panel is hidden). If the current session accounts for at least 20% of that hour's cost, it also shows a warning with the action to take (at most once every 30 minutes per account).
+While usage is spiking (the 5-hour usage rose 5 points or more within 15 minutes; for accounts without a 5-hour window, the 7-day usage rose 2 points or more within an hour), the panel analyzes the last hour of this machine's pi sessions and adds a `원인:` line with the main pattern (also shown in the usage line while the panel is hidden). If the current session accounts for at least 20% of that hour's cost, it also shows a warning with the action to take (at most once every 30 minutes per account).
+
+Once the spike stops, the cause line turns into a dim `급증 멈춤 14:32 · 동시 실행` for three hours, so the panel no longer looks like the problem is still going on. A window that would run out before it resets only turns the usage red; it does not add a cause.
 
 `/quota why` opens the full analysis: the usage rise, the main cause and the action, other causes, the top sessions (the current one is marked), the cost split, context size, models and tools. `tab` switches accounts, `←`/`→` change the range, `esc` closes it.
 
@@ -83,6 +87,29 @@ When the 5-hour usage rises by 5 points or more within 15 minutes, or either win
 | 출력 과다 | Output is 40%+ of the cost | Lower the thinking level and shorten outputs |
 | 외부 사용 | Usage rose 3+ points but this machine logged fewer than 3 turns | Check other machines and Claude Code / Codex CLI |
 | 비싼 모델 | An Opus model is 80%+ of the cost (shown with another cause) | Use Sonnet or Haiku for routine work |
+
+## Checking whether a fix worked
+
+Run `/quota mark` right after you change something (fewer parallel sessions, `/compact`, a patch to a polling loop):
+
+```
+/quota mark claude 1h 서브에이전트 동시 실행 줄임
+```
+
+The extension records the moment, picks the period before it (the latest spike when there was one in the last three hours, otherwise the hour before the mark) and the session that cost the most in that period. While it measures, the panel shows `조치 효과 측정 중 · 42m 남음`. When the window ends, the session that started it (or any other TUI session after three more minutes) compares both periods once and notifies the result, which stays in the panel and the usage line for three hours:
+
+| Verdict | Meaning |
+|---|---|
+| 개선 | Cost per hour of the problem session (or of this machine, if that session was not used afterwards) fell by 40% or more |
+| 변화 작음 | Between −40% and +10% |
+| 악화 | Rose by 10% or more |
+| 급증 재발 | The usage spiked again during the window |
+| 판단 불가 | Too little work after the fix to compare |
+| 측정 중 | Less than 20 minutes have passed |
+
+`/quota check` shows the comparison at any time, including halfway: usage rate, cost per hour, the problem session, turns per minute, context size, concurrency and the causes that went away or remain. `r` recomputes, `tab` switches accounts.
+
+Agents can do the same through the `quota_effect` tool (`action: "mark" | "check"`), so "measure the session for an hour after this patch and tell me if it was fine" works without the agent waiting or polling: it marks, ends its turn, and the extension notifies when the hour is over.
 
 Cost comes from pi's session logs and only approximates how providers count usage against the limits. For models without prices, tokens weighted by relative price (output ×5, cache read ×0.1, cache write ×1.25) are used instead.
 

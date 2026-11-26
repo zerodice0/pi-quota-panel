@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.7.1
+
+- The projected exhaustion time is shorter and relative after today: `5일 내 소진` or `9시간 내 소진` instead of the day of the month and hour (`1일 8시 소진`), which was cut off on narrow screens and easy to misread.
+
 ## 0.7.0
 
 - `/quota mark [claude|codex] [30m|1h|2h|3h] [memo]` records the moment of a fix and measures its effect: the period after it is compared with the latest spike (or the hour before), led by the cost per hour of the session that caused it. The verdict (개선, 변화 작음, 악화, 급증 재발, 판단 불가) is notified once when the window ends and stays in the panel and the usage line for three hours.

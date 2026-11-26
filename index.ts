@@ -221,21 +221,27 @@ function trendOf(samples: Sample[], win: NonNullable<Win>, key: WindowKey): Tren
 	};
 }
 
-function clock(ts: number): string {
+/**
+ * 소진 예상 시각을 짧게. 오늘 안이면 "19:01", 24시간 안이면 "9시간 내", 그 뒤는 "5일 내".
+ * 예전의 "1일 8시"(날짜·시)는 길어서 좁은 화면에서 잘리고, 며칠 뒤인지 바로 알기 어려웠음
+ */
+function etaText(ts: number): string {
 	const d = new Date(ts);
-	const now = new Date();
-	const hm = `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
-	return d.toDateString() === now.toDateString() ? hm : `${d.getDate()}일 ${d.getHours()}시`;
+	const now = Date.now();
+	if (d.toDateString() === new Date(now).toDateString())
+		return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+	const ms = Math.max(0, ts - now);
+	return ms < 24 * 3600_000 ? `${Math.ceil(ms / 3600_000)}시간 내` : `${Math.ceil(ms / (24 * 3600_000))}일 내`;
 }
 
-/** 예: "+18%/h · 14:20 소진 예상"(리셋 전에 다 씀), "+4%/h · 리셋까지 여유" */
+/** 예: "+18%/h · 14:20 소진 예상", "+16%/일 · 5일 내 소진 예상"(리셋 전에 다 씀), "+4%/h · 리셋까지 여유" */
 function trendText(w: NonNullable<Win>): { text: string; danger: boolean } | undefined {
 	const t = w.trend;
 	if (!t || t.rate <= 0) return undefined;
 	const value = t.rate >= 10 ? Math.round(t.rate) : Math.round(t.rate * 10) / 10;
 	const rate = `+${value}%/${t.unit === "h" ? "h" : "일"}`;
 	const danger = isDanger(w);
-	return { text: danger ? `${rate} · ${clock(t.eta!)} 소진 예상` : `${rate} · 리셋까지 여유`, danger };
+	return { text: danger ? `${rate} · ${etaText(t.eta!)} 소진 예상` : `${rate} · 리셋까지 여유`, danger };
 }
 
 // ── 원인 분석 화면 ──────────────────────────────────────────
@@ -367,7 +373,7 @@ function statusText(rows: Row[], detail: Detail): string {
 		const t = trendText(w);
 		if (t) {
 			const rate = t.text.split(" · ")[0];
-			text += ` ${fg(t.danger ? C.crit : C.dim, t.danger ? `${rate} ${clock(w.trend!.eta!)} 소진` : rate)}`;
+			text += ` ${fg(t.danger ? C.crit : C.dim, t.danger ? `${rate} ${etaText(w.trend!.eta!)} 소진` : rate)}`;
 		}
 		if (r.cause) text += ` ${fg(C.warn, r.cause)}`;
 		else if (r.resolved) text += ` ${fg(C.dim, `급증 멈춤 ${hm(r.resolved.at)}`)}`;

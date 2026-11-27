@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.7.2
+
+- The exhaustion time after today is shown in days and hours, rounded down (`4일 3시간 뒤 소진`). 0.7.1 rounded up to whole days, so a window running out in 4.1 days read `5일 내` next to a reset in 4d14h and the red warning looked wrong.
+
 ## 0.7.1
 
 - The projected exhaustion time is shorter and relative after today: `5일 내 소진` or `9시간 내 소진` instead of the day of the month and hour (`1일 8시 소진`), which was cut off on narrow screens and easy to misread.

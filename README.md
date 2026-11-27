@@ -60,7 +60,7 @@ The panel is hidden when the terminal is too narrow to fit it (44 columns).
 
 ## Burn rate and history
 
-Under each window the panel shows how fast it is being used: the last 30 minutes for the 5-hour window (`%/h`) and the last 6 hours for the 7-day window (`%/일`). The spans are short on purpose, so the rate drops soon after a fix instead of carrying the spike for an hour or a day. If the window would run out before it resets at that pace, the line turns red and shows when it runs out: the time if it is today (`19:34 소진 예상`), otherwise hours or days from now (`9시간 내`, `5일 내 소진 예상`); otherwise it reads `리셋까지 여유`. The line appears once there are enough samples (10 minutes for 5h, 2 hours for 7d).
+Under each window the panel shows how fast it is being used: the last 30 minutes for the 5-hour window (`%/h`) and the last 6 hours for the 7-day window (`%/일`). The spans are short on purpose, so the rate drops soon after a fix instead of carrying the spike for an hour or a day. If the window would run out before it resets at that pace, the line turns red and shows when it runs out: the time if it is today (`19:34 소진`), otherwise how long from now, rounded down so it can be compared with the reset time (`9시간 뒤 소진`, `4일 3시간 뒤 소진`); otherwise it reads `리셋까지 여유`. The line appears once there are enough samples (10 minutes for 5h, 2 hours for 7d).
 
 History lives in a small SQLite database, `~/.pi/agent/quota-panel.db`, through Node's built-in `node:sqlite` (no extra dependency):
 

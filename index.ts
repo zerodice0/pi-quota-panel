@@ -222,8 +222,9 @@ function trendOf(samples: Sample[], win: NonNullable<Win>, key: WindowKey): Tren
 }
 
 /**
- * 소진 예상 시각을 짧게. 오늘 안이면 "19:01", 24시간 안이면 "9시간 내", 그 뒤는 "5일 내".
- * 예전의 "1일 8시"(날짜·시)는 길어서 좁은 화면에서 잘리고, 며칠 뒤인지 바로 알기 어려웠음
+ * 소진 예상 시각을 짧게. 오늘 안이면 "19:01", 24시간 안이면 "9시간 뒤", 그 뒤는 "4일 3시간 뒤".
+ * 예전의 "1일 8시"(날짜·시)는 길어서 좁은 화면에서 잘리고, 며칠 뒤인지 바로 알기 어려웠음.
+ * 올림하면 안 됨: 4.1일을 "5일 내"로 쓰면 리셋(4d14h)보다 늦어 보여, 빨간색 경고와 어긋남. 리셋 표시와 비교할 수 있게 내림해 시간까지 적음
  */
 function etaText(ts: number): string {
 	const d = new Date(ts);
@@ -231,17 +232,20 @@ function etaText(ts: number): string {
 	if (d.toDateString() === new Date(now).toDateString())
 		return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 	const ms = Math.max(0, ts - now);
-	return ms < 24 * 3600_000 ? `${Math.ceil(ms / 3600_000)}시간 내` : `${Math.ceil(ms / (24 * 3600_000))}일 내`;
+	const hours = Math.floor(ms / 3600_000);
+	if (hours < 1) return `${Math.floor(ms / 60_000)}분 뒤`;
+	if (hours < 24) return `${hours}시간 뒤`;
+	return hours % 24 ? `${Math.floor(hours / 24)}일 ${hours % 24}시간 뒤` : `${hours / 24}일 뒤`;
 }
 
-/** 예: "+18%/h · 14:20 소진 예상", "+16%/일 · 5일 내 소진 예상"(리셋 전에 다 씀), "+4%/h · 리셋까지 여유" */
+/** 예: "+18%/h · 14:20 소진", "+16%/일 · 4일 3시간 뒤 소진"(리셋 전에 다 씀), "+4%/h · 리셋까지 여유" */
 function trendText(w: NonNullable<Win>): { text: string; danger: boolean } | undefined {
 	const t = w.trend;
 	if (!t || t.rate <= 0) return undefined;
 	const value = t.rate >= 10 ? Math.round(t.rate) : Math.round(t.rate * 10) / 10;
 	const rate = `+${value}%/${t.unit === "h" ? "h" : "일"}`;
 	const danger = isDanger(w);
-	return { text: danger ? `${rate} · ${etaText(t.eta!)} 소진 예상` : `${rate} · 리셋까지 여유`, danger };
+	return { text: danger ? `${rate} · ${etaText(t.eta!)} 소진` : `${rate} · 리셋까지 여유`, danger };
 }
 
 // ── 원인 분석 화면 ──────────────────────────────────────────
